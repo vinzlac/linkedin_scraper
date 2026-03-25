@@ -61,6 +61,10 @@ run-feed:
 run-person PROFILE:
     uv run python samples/scrape_person.py {{ PROFILE }}
 
+# Debug DOM selectors on a profile page (helps fix broken selectors)
+debug-person PROFILE:
+    uv run python samples/debug_person.py {{ PROFILE }}
+
 # Run the company posts scraper sample
 run-company URL="https://www.linkedin.com/company/microsoft/":
     uv run python samples/scrape_company_posts.py

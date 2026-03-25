@@ -112,11 +112,23 @@ class PersonScraper(BaseScraper):
     async def _get_name_and_location(self) -> tuple[str, Optional[str]]:
         """Extract name and location from profile."""
         try:
-            name = await self.safe_extract_text("h1", default="Unknown")
-            location = await self.safe_extract_text(
-                ".text-body-small.inline.t-black--light.break-words", default=""
-            )
-            return name, location if location else None
+            # Page title is the most stable source: "Name | LinkedIn"
+            title = await self.page.title()
+            name = title.split(" | ")[0].strip() if " | " in title else "Unknown"
+
+            # Location: parse main text — structure is "Name \n Headline \n Location · Coordonnées..."
+            location = await self.page.evaluate('''() => {
+                const main = document.querySelector("main");
+                if (!main) return null;
+                // Take text before the "·" separator (contact info marker)
+                const text = main.innerText.split("·")[0];
+                const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
+                // lines[0]=name, lines[1]=headline, lines[2]=location
+                if (lines.length >= 3) return lines[2];
+                return null;
+            }''')
+
+            return name, location
         except Exception as e:
             logger.warning(f"Error getting name/location: {e}")
             return "Unknown", None
@@ -133,356 +145,90 @@ class PersonScraper(BaseScraper):
             return False
 
     async def _get_about(self) -> Optional[str]:
-        """Extract about section."""
+        """Extract about section via JS — robust to obfuscated class names."""
         try:
-            # Find the profile card that contains "About"
-            profile_cards = await self.page.locator(
-                '[data-view-name="profile-card"]'
-            ).all()
-
-            for card in profile_cards:
-                card_text = await card.inner_text()
-                # Check if this card contains "About" heading
-                if card_text.strip().startswith("About"):
-                    # Get the span with aria-hidden to avoid duplication
-                    about_spans = await card.locator('span[aria-hidden="true"]').all()
-                    # Skip the first span (it's the "About" heading), get the content
-                    if len(about_spans) > 1:
-                        about_text = await about_spans[1].text_content()
-                        return about_text.strip() if about_text else None
-
-            return None
+            about = await self.page.evaluate('''() => {
+                const main = document.querySelector("main");
+                if (!main) return null;
+                const aboutKeywords = ["about", "\xe0 propos", "infos", "info", "sobre", "uber mich", "acerca"];
+                for (const h2 of main.querySelectorAll("h2")) {
+                    const heading = (h2.innerText || "").trim().toLowerCase();
+                    if (!aboutKeywords.some(k => heading.includes(k))) continue;
+                    // Walk up to find the section container, then grab content spans
+                    let container = h2.parentElement;
+                    for (let i = 0; i < 6 && container && container !== main; i++) {
+                        const spans = container.querySelectorAll("span, p");
+                        for (const span of spans) {
+                            const t = (span.innerText || "").trim();
+                            if (t.length > 30 && !aboutKeywords.some(k => t.toLowerCase() === k)) {
+                                return t;
+                            }
+                        }
+                        container = container.parentElement;
+                    }
+                }
+                return null;
+            }''')
+            return about
         except Exception as e:
             logger.debug(f"Error getting about section: {e}")
             return None
 
     async def _get_experiences(self, base_url: str) -> list[Experience]:
-        """Extract experiences from the main profile page Experience section."""
-        experiences = []
-
+        """Extract experiences from /details/experience/ using JS text parsing."""
         try:
-            experience_heading = self.page.locator('h2:has-text("Experience")').first
-            
-            if await experience_heading.count() > 0:
-                experience_section = experience_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
-                if await experience_section.count() == 0:
-                    experience_section = experience_heading.locator('xpath=ancestor::*[4]')
-                
-                if await experience_section.count() > 0:
-                    items = await experience_section.locator('ul > li, ol > li').all()
-                    
-                    for item in items:
-                        try:
-                            exp = await self._parse_main_page_experience(item)
-                            if exp:
-                                experiences.append(exp)
-                        except Exception as e:
-                            logger.debug(f"Error parsing experience from main page: {e}")
-                            continue
-            
-            if not experiences:
-                exp_url = urljoin(base_url, "details/experience")
-                await self.navigate_and_wait(exp_url)
-                await self.page.wait_for_selector("main", timeout=10000)
-                await self.wait_and_focus(1.5)
-                await self.scroll_page_to_half()
-                await self.scroll_page_to_bottom(pause_time=0.5, max_scrolls=5)
+            exp_url = base_url.rstrip('/') + '/details/experience/'
+            await self.navigate_and_wait(exp_url)
+            await self.page.wait_for_timeout(2000)
+            for _ in range(3):
+                await self.page.keyboard.press('End')
+                await self.page.wait_for_timeout(700)
 
-                items = []
-                main_element = self.page.locator('main')
-                if await main_element.count() > 0:
-                    list_items = await main_element.locator('list > listitem, ul > li').all()
-                    if list_items:
-                        items = list_items
-                
-                if not items:
-                    old_list = self.page.locator(".pvs-list__container").first
-                    if await old_list.count() > 0:
-                        items = await old_list.locator(".pvs-list__paged-list-item").all()
+            items_data = await self.page.evaluate('''() => {
+                const main = document.querySelector("main");
+                if (!main) return [];
+                const datePattern = /\\b(20\\d{2}|19\\d{2}|janv|f\\xe9vr|mars|avr|mai|juin|juil|ao\\xfbt|sept|oct|nov|d\\xe9c|jan|feb|mar|apr|jun|jul|aug|sep|dec)\\b/i;
+                const results = [];
+                for (const el of main.querySelectorAll("div, section")) {
+                    const text = el.innerText?.trim() || "";
+                    if (text.length < 15 || text.length > 1000) continue;
+                    if (!datePattern.test(text)) continue;
+                    if (el.querySelectorAll("div").length > 5) continue;
+                    const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
+                    if (lines.length >= 2) results.push(lines);
+                }
+                return results;
+            }''')
 
-                for item in items:
-                    try:
-                        result = await self._parse_experience_item(item)
-                        if result:
-                            if isinstance(result, list):
-                                experiences.extend(result)
-                            else:
-                                experiences.append(result)
-                    except Exception as e:
-                        logger.debug(f"Error parsing experience item: {e}")
-                        continue
+            experiences = []
+            for lines in items_data:
+                try:
+                    title = lines[0]
+                    company_raw = lines[1] if len(lines) > 1 else ''
+                    company = company_raw.split(' · ')[0].strip()
+                    dates_str = lines[2] if len(lines) > 2 else ''
+                    location_raw = lines[3] if len(lines) > 3 else ''
+                    location = location_raw.split(' · ')[0].strip() or None
+                    description = '\n'.join(lines[4:]) if len(lines) > 4 else None
 
-        except Exception as e:
-            logger.warning(
-                f"Error getting experiences: {e}. The experience section may not be available or the page structure has changed."
-            )
+                    from_date, to_date, duration = self._parse_work_times(dates_str)
 
-        return experiences
-    
-    async def _parse_main_page_experience(self, item) -> Optional[Experience]:
-        """Parse experience from main profile page list item with [logo_link, details_link] structure."""
-        try:
-            links = await item.locator('a').all()
-            if len(links) < 2:
-                return None
-            
-            company_url = await links[0].get_attribute('href')
-            detail_link = links[1]
-            
-            unique_texts = await self._extract_unique_texts_from_element(detail_link)
-            
-            if len(unique_texts) < 2:
-                return None
-            
-            position_title = unique_texts[0]
-            company_name = unique_texts[1]
-            work_times = unique_texts[2] if len(unique_texts) > 2 else ""
-            
-            from_date, to_date, duration = self._parse_work_times(work_times)
-            
-            return Experience(
-                position_title=position_title,
-                institution_name=company_name,
-                linkedin_url=company_url,
-                from_date=from_date,
-                to_date=to_date,
-                duration=duration,
-                location=None,
-                description=None,
-            )
-            
-        except Exception as e:
-            logger.debug(f"Error parsing main page experience: {e}")
-            return None
-    
-    async def _extract_unique_texts_from_element(self, element) -> list[str]:
-        """Extract unique text content from nested elements, avoiding duplicates from parent/child overlap."""
-        text_elements = await element.locator('span[aria-hidden="true"], div > span').all()
-        
-        if not text_elements:
-            text_elements = await element.locator('span, div').all()
-        
-        seen_texts = set()
-        unique_texts = []
-        
-        for el in text_elements:
-            text = await el.text_content()
-            if text and text.strip():
-                text = text.strip()
-                if text not in seen_texts and len(text) < 200 and not any(text in t or t in text for t in seen_texts if len(t) > 3):
-                    seen_texts.add(text)
-                    unique_texts.append(text)
-        
-        return unique_texts
-
-    async def _parse_experience_item(self, item):
-        """Parse experience item. Returns Experience or list for nested positions."""
-        try:
-            links = await item.locator('a, link').all()
-            if len(links) >= 2:
-                company_url = await links[0].get_attribute('href')
-                detail_link = links[1]
-                
-                generics = await detail_link.locator('generic, span, div').all()
-                texts = []
-                for g in generics:
-                    text = await g.text_content()
-                    if text and text.strip() and len(text.strip()) < 200:
-                        texts.append(text.strip())
-                
-                unique_texts = list(dict.fromkeys(texts))
-                
-                if len(unique_texts) >= 2:
-                    position_title = unique_texts[0]
-                    company_name = unique_texts[1]
-                    work_times = unique_texts[2] if len(unique_texts) > 2 else ""
-                    location = unique_texts[3] if len(unique_texts) > 3 else ""
-                    
-                    from_date, to_date, duration = self._parse_work_times(work_times)
-                    
-                    return Experience(
-                        position_title=position_title,
-                        institution_name=company_name,
-                        linkedin_url=company_url,
+                    experiences.append(Experience(
+                        position_title=title,
+                        institution_name=company,
                         from_date=from_date,
                         to_date=to_date,
                         duration=duration,
                         location=location,
-                        description=None,
-                    )
-            
-            entity = item.locator('div[data-view-name="profile-component-entity"]').first
-            if await entity.count() == 0:
-                return None
-
-            children = await entity.locator("> *").all()
-            if len(children) < 2:
-                return None
-
-            company_link = children[0].locator("a").first
-            company_url = await company_link.get_attribute("href")
-
-            detail_container = children[1]
-            detail_children = await detail_container.locator("> *").all()
-
-            if len(detail_children) == 0:
-                return None
-
-            has_nested_positions = False
-            if len(detail_children) > 1:
-                nested_list = await detail_children[1].locator(".pvs-list__container").count()
-                has_nested_positions = nested_list > 0
-
-            if has_nested_positions:
-                return await self._parse_nested_experience(item, company_url, detail_children)
-            else:
-                first_detail = detail_children[0]
-                nested_elements = await first_detail.locator("> *").all()
-
-                if len(nested_elements) == 0:
-                    return None
-
-                span_container = nested_elements[0]
-                outer_spans = await span_container.locator("> *").all()
-
-                position_title = ""
-                company_name = ""
-                work_times = ""
-                location = ""
-
-                if len(outer_spans) >= 1:
-                    aria_span = outer_spans[0].locator('span[aria-hidden="true"]').first
-                    position_title = await aria_span.text_content()
-                if len(outer_spans) >= 2:
-                    aria_span = outer_spans[1].locator('span[aria-hidden="true"]').first
-                    company_name = await aria_span.text_content()
-                if len(outer_spans) >= 3:
-                    aria_span = outer_spans[2].locator('span[aria-hidden="true"]').first
-                    work_times = await aria_span.text_content()
-                if len(outer_spans) >= 4:
-                    aria_span = outer_spans[3].locator('span[aria-hidden="true"]').first
-                    location = await aria_span.text_content()
-
-                from_date, to_date, duration = self._parse_work_times(work_times)
-
-                description = ""
-                if len(detail_children) > 1:
-                    description = await detail_children[1].inner_text()
-
-                return Experience(
-                    position_title=position_title.strip(),
-                    institution_name=company_name.strip(),
-                    linkedin_url=company_url,
-                    from_date=from_date,
-                    to_date=to_date,
-                    duration=duration,
-                    location=location.strip(),
-                    description=description.strip() if description else None,
-                )
-
-        except Exception as e:
-            logger.debug(f"Error parsing experience: {e}")
-            return None
-
-    async def _parse_nested_experience(
-        self, item, company_url: str, detail_children
-    ) -> list[Experience]:
-        """
-        Parse nested experience positions (multiple roles at the same company).
-        Returns a list of Experience objects.
-        """
-        experiences = []
-
-        try:
-            # Get company name from first detail
-            first_detail = detail_children[0]
-            nested_elements = await first_detail.locator("> *").all()
-            if len(nested_elements) == 0:
-                return []
-
-            span_container = nested_elements[0]
-            outer_spans = await span_container.locator("> *").all()
-
-            # First span is company name for nested positions
-            company_name = ""
-            if len(outer_spans) >= 1:
-                aria_span = outer_spans[0].locator('span[aria-hidden="true"]').first
-                company_name = await aria_span.text_content()
-
-            # Get the nested list from detail_children[1]
-            nested_container = detail_children[1].locator(".pvs-list__container").first
-            nested_items = await nested_container.locator(
-                ".pvs-list__paged-list-item"
-            ).all()
-
-            for nested_item in nested_items:
-                try:
-                    # Each nested item has a link with position details
-                    link = nested_item.locator("a").first
-                    link_children = await link.locator("> *").all()
-
-                    if len(link_children) == 0:
-                        continue
-
-                    # Navigate to get the spans
-                    first_child = link_children[0]
-                    nested_els = await first_child.locator("> *").all()
-                    if len(nested_els) == 0:
-                        continue
-
-                    spans_container = nested_els[0]
-                    position_spans = await spans_container.locator("> *").all()
-
-                    # Extract position details
-                    position_title = ""
-                    work_times = ""
-                    location = ""
-
-                    if len(position_spans) >= 1:
-                        aria_span = (
-                            position_spans[0].locator('span[aria-hidden="true"]').first
-                        )
-                        position_title = await aria_span.text_content()
-                    if len(position_spans) >= 2:
-                        aria_span = (
-                            position_spans[1].locator('span[aria-hidden="true"]').first
-                        )
-                        work_times = await aria_span.text_content()
-                    if len(position_spans) >= 3:
-                        aria_span = (
-                            position_spans[2].locator('span[aria-hidden="true"]').first
-                        )
-                        location = await aria_span.text_content()
-
-                    # Parse dates
-                    from_date, to_date, duration = self._parse_work_times(work_times)
-
-                    # Get description if available
-                    description = ""
-                    if len(link_children) > 1:
-                        description = await link_children[1].inner_text()
-
-                    experiences.append(
-                        Experience(
-                            position_title=position_title.strip(),
-                            institution_name=company_name.strip(),
-                            linkedin_url=company_url,
-                            from_date=from_date,
-                            to_date=to_date,
-                            duration=duration,
-                            location=location.strip(),
-                            description=description.strip() if description else None,
-                        )
-                    )
-
+                        description=description,
+                    ))
                 except Exception as e:
-                    logger.debug(f"Error parsing nested position: {e}")
-                    continue
+                    logger.debug(f"Error parsing experience item: {e}")
+            return experiences
 
         except Exception as e:
-            logger.debug(f"Error parsing nested experience: {e}")
-
-        return experiences
+            logger.warning(f"Error getting experiences: {e}")
+            return []
 
     def _parse_work_times(
         self, work_times: str
@@ -519,213 +265,65 @@ class PersonScraper(BaseScraper):
             return None, None, None
 
     async def _get_educations(self, base_url: str) -> list[Education]:
-        """Extract educations from the main profile page Education section."""
-        educations = []
-
+        """Extract educations from /details/education/ using JS text parsing."""
         try:
-            education_heading = self.page.locator('h2:has-text("Education")').first
-            
-            if await education_heading.count() > 0:
-                education_section = education_heading.locator('xpath=ancestor::*[.//ul or .//ol][1]')
-                if await education_section.count() == 0:
-                    education_section = education_heading.locator('xpath=ancestor::*[4]')
-                
-                if await education_section.count() > 0:
-                    items = await education_section.locator('ul > li, ol > li').all()
-                    
-                    for item in items:
-                        try:
-                            edu = await self._parse_main_page_education(item)
-                            if edu:
-                                educations.append(edu)
-                        except Exception as e:
-                            logger.debug(f"Error parsing education from main page: {e}")
-                            continue
-            
-            if not educations:
-                edu_url = urljoin(base_url, "details/education")
-                await self.navigate_and_wait(edu_url)
-                await self.page.wait_for_selector("main", timeout=10000)
-                await self.wait_and_focus(2)
-                await self.scroll_page_to_half()
-                await self.scroll_page_to_bottom(pause_time=0.5, max_scrolls=5)
+            edu_url = base_url.rstrip('/') + '/details/education/'
+            await self.navigate_and_wait(edu_url)
+            await self.page.wait_for_timeout(2000)
+            for _ in range(3):
+                await self.page.keyboard.press('End')
+                await self.page.wait_for_timeout(700)
 
-                items = []
-                main_element = self.page.locator('main')
-                if await main_element.count() > 0:
-                    list_items = await main_element.locator('ul > li, ol > li').all()
-                    if list_items:
-                        items = list_items
-                
-                if not items:
-                    old_list = self.page.locator(".pvs-list__container").first
-                    if await old_list.count() > 0:
-                        items = await old_list.locator(".pvs-list__paged-list-item").all()
+            items_data = await self.page.evaluate('''() => {
+                const main = document.querySelector("main");
+                if (!main) return [];
+                // Education items: divs containing a 4-digit year
+                const yearPattern = /\\b(19|20)\\d{2}\\b/;
+                const results = [];
+                for (const el of main.querySelectorAll("div, section")) {
+                    const text = el.innerText?.trim() || "";
+                    if (text.length < 5 || text.length > 800) continue;
+                    if (!yearPattern.test(text)) continue;
+                    if (el.querySelectorAll("div").length > 5) continue;
+                    const lines = text.split("\\n").map(l => l.trim()).filter(Boolean);
+                    if (lines.length >= 1) results.push(lines);
+                }
+                return results;
+            }''')
 
-                for item in items:
-                    try:
-                        edu = await self._parse_education_item(item)
-                        if edu:
-                            educations.append(edu)
-                    except Exception as e:
-                        logger.debug(f"Error parsing education item: {e}")
-                        continue
-
-        except Exception as e:
-            logger.warning(
-                f"Error getting educations: {e}. The education section may not be publicly visible or the page structure has changed."
-            )
-
-        return educations
-    
-    async def _parse_main_page_education(self, item) -> Optional[Education]:
-        """Parse education from main profile page list item with [logo_link, details_link] structure."""
-        try:
-            links = await item.locator('a').all()
-            if not links:
-                return None
-            
-            institution_url = await links[0].get_attribute('href')
-            detail_link = links[1] if len(links) > 1 else links[0]
-            
-            unique_texts = await self._extract_unique_texts_from_element(detail_link)
-            
-            if not unique_texts:
-                return None
-            
-            institution_name = unique_texts[0]
-            degree = None
-            times = ""
-            
-            if len(unique_texts) == 3:
-                degree = unique_texts[1]
-                times = unique_texts[2]
-            elif len(unique_texts) == 2:
-                second = unique_texts[1]
-                if " - " in second or any(c.isdigit() for c in second):
-                    times = second
-                else:
-                    degree = second
-            
-            from_date, to_date = self._parse_education_times(times)
-            
-            return Education(
-                institution_name=institution_name,
-                degree=degree.strip() if degree else None,
-                linkedin_url=institution_url,
-                from_date=from_date,
-                to_date=to_date,
-                description=None,
-            )
-            
-        except Exception as e:
-            logger.debug(f"Error parsing main page education: {e}")
-            return None
-
-    async def _parse_education_item(self, item) -> Optional[Education]:
-        """Parse a single education item."""
-        try:
-            links = await item.locator('a, link').all()
-            if len(links) >= 1:
-                institution_url = await links[0].get_attribute('href')
-                
-                detail_link = links[1] if len(links) >= 2 else links[0]
-                generics = await detail_link.locator('generic, span, div').all()
-                texts = []
-                for g in generics:
-                    text = await g.text_content()
-                    if text and text.strip() and len(text.strip()) < 200:
-                        texts.append(text.strip())
-                
-                unique_texts = list(dict.fromkeys(texts))
-                
-                if unique_texts:
-                    institution_name = unique_texts[0]
+            educations = []
+            for lines in items_data:
+                try:
+                    institution = lines[0]
                     degree = None
-                    times = ""
-                    
-                    if len(unique_texts) == 3:
-                        degree = unique_texts[1]
-                        times = unique_texts[2]
-                    elif len(unique_texts) == 2:
-                        second = unique_texts[1]
-                        if " - " in second or second.isdigit() or any(c.isdigit() for c in second):
-                            times = second
+                    times = ''
+
+                    if len(lines) == 2:
+                        # Could be degree or dates
+                        if any(c.isdigit() for c in lines[1]):
+                            times = lines[1]
                         else:
-                            degree = second
-                    
+                            degree = lines[1]
+                    elif len(lines) >= 3:
+                        degree = lines[1]
+                        times = lines[2]
+
                     from_date, to_date = self._parse_education_times(times)
-                    
-                    return Education(
-                        institution_name=institution_name,
-                        degree=degree.strip() if degree else None,
-                        linkedin_url=institution_url,
+
+                    educations.append(Education(
+                        institution_name=institution,
+                        degree=degree,
                         from_date=from_date,
                         to_date=to_date,
-                        description=None,
-                    )
-            
-            entity = item.locator('div[data-view-name="profile-component-entity"]').first
-            if await entity.count() == 0:
-                return None
-
-            children = await entity.locator("> *").all()
-            if len(children) < 2:
-                return None
-
-            institution_link = children[0].locator("a").first
-            institution_url = await institution_link.get_attribute("href")
-
-            detail_container = children[1]
-            detail_children = await detail_container.locator("> *").all()
-
-            if len(detail_children) == 0:
-                return None
-
-            first_detail = detail_children[0]
-            nested_elements = await first_detail.locator("> *").all()
-
-            if len(nested_elements) == 0:
-                return None
-
-            span_container = nested_elements[0]
-            outer_spans = await span_container.locator("> *").all()
-
-            institution_name = ""
-            degree = None
-            times = ""
-
-            if len(outer_spans) >= 1:
-                aria_span = outer_spans[0].locator('span[aria-hidden="true"]').first
-                institution_name = await aria_span.text_content()
-
-            if len(outer_spans) == 3:
-                aria_span = outer_spans[1].locator('span[aria-hidden="true"]').first
-                degree = await aria_span.text_content()
-                aria_span = outer_spans[2].locator('span[aria-hidden="true"]').first
-                times = await aria_span.text_content()
-            elif len(outer_spans) == 2:
-                aria_span = outer_spans[1].locator('span[aria-hidden="true"]').first
-                times = await aria_span.text_content()
-
-            from_date, to_date = self._parse_education_times(times)
-
-            description = ""
-            if len(detail_children) > 1:
-                description = await detail_children[1].inner_text()
-
-            return Education(
-                institution_name=institution_name.strip(),
-                degree=degree.strip() if degree else None,
-                linkedin_url=institution_url,
-                from_date=from_date,
-                to_date=to_date,
-                description=description.strip() if description else None,
-            )
+                        description='\n'.join(lines[3:]) if len(lines) > 3 else None,
+                    ))
+                except Exception as e:
+                    logger.debug(f"Error parsing education item: {e}")
+            return educations
 
         except Exception as e:
-            logger.debug(f"Error parsing education: {e}")
-            return None
+            logger.warning(f"Error getting educations: {e}")
+            return []
 
     def _parse_education_times(self, times: str) -> tuple[Optional[str], Optional[str]]:
         """
