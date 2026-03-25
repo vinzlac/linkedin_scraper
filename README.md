@@ -46,21 +46,28 @@ asyncio.run(main())
 ```bash
 pip install linkedin-scraper==2.11.2
 ```
-## Quick Testing
+## Quick Start (development)
 
-To test that this works, you can clone this repo, install dependencies with
-```
+```bash
 git clone https://github.com/joeyism/linkedin_scraper.git
 cd linkedin_scraper
-pip3 install -e .
+
+# Install dependencies + Playwright browser
+just install
+
+# Create your LinkedIn session (manual login in browser)
+just session
+
+# Scrape a profile (slug or full URL)
+just run-person your-linkedin-slug
+
+# Scrape your feed
+just run-feed
 ```
-then run
-```
-python3 samples/create_session.py
-python3 samples/scrape_company.py
-python3 samples/scrape_person.py
-```
-and you will see the scraping in action.
+
+Run `just` with no arguments to list all available commands.
+
+---
 
 ---
 
@@ -81,7 +88,12 @@ and you will see the scraping in action.
   - Post content and text
   - Reactions, comments, reposts counts
   - Posted date and images
-  
+
+- **Feed** - Scrape your authenticated LinkedIn feed
+  - Author name and profile URL
+  - Post content, date, reactions, comments, reposts
+  - Sponsored/promoted posts automatically filtered out
+
 - **Job Listings** - Scrape job postings
   - Job details and requirements
   - Company information
@@ -94,14 +106,16 @@ and you will see the scraping in action.
 
 ## Installation
 
+**From PyPI:**
 ```bash
 pip install linkedin-scraper
+playwright install chromium
 ```
 
-### Install Playwright browsers:
-
+**From source (recommended for development):**
 ```bash
-playwright install chromium
+# Requires uv and just
+just install
 ```
 
 ## Quick Start
@@ -187,13 +201,13 @@ from linkedin_scraper import BrowserManager, CompanyPostsScraper
 async def scrape_company_posts():
     async with BrowserManager(headless=False) as browser:
         await browser.load_session("session.json")
-        
+
         scraper = CompanyPostsScraper(browser.page)
         posts = await scraper.scrape(
             "https://linkedin.com/company/microsoft/",
             limit=10
         )
-        
+
         for post in posts:
             print(f"Posted: {post.posted_date}")
             print(f"Text: {post.text[:200]}...")
@@ -203,6 +217,34 @@ async def scrape_company_posts():
             print("---")
 
 asyncio.run(scrape_company_posts())
+```
+
+### Feed Scraping
+
+```python
+from linkedin_scraper import BrowserManager, FeedScraper
+
+async def scrape_feed():
+    async with BrowserManager(headless=False) as browser:
+        await browser.load_session("session.json")
+
+        scraper = FeedScraper(browser.page)
+        posts = await scraper.scrape(limit=20)
+
+        for post in posts:
+            print(f"Author: {post.author_name} ({post.author_url})")
+            print(f"Posted: {post.posted_date}")
+            print(f"Text: {post.text[:200]}...")
+            print(f"Reactions: {post.reactions_count}")
+            print("---")
+
+asyncio.run(scrape_feed())
+```
+
+Or via the command line:
+
+```bash
+just run-feed
 ```
 
 ## Authentication
@@ -341,12 +383,16 @@ class Job(BaseModel):
 class Post(BaseModel):
     linkedin_url: Optional[str]
     urn: Optional[str]
+    author_name: Optional[str]
+    author_url: Optional[str]
     text: Optional[str]
     posted_date: Optional[str]
     reactions_count: Optional[int]
     comments_count: Optional[int]
     reposts_count: Optional[int]
     image_urls: List[str]
+    video_url: Optional[str]
+    article_url: Optional[str]
 ```
 
 ## Advanced Usage
@@ -399,11 +445,10 @@ except ProfileNotFoundError:
 
 ## Requirements
 
-- Python 3.8+
-- Playwright
-- Pydantic 2.0+
-- aiofiles
-- python-dotenv (optional, for credentials)
+- Python 3.9+
+- [uv](https://docs.astral.sh/uv/) (package manager)
+- [just](https://just.systems/) (task runner)
+- Playwright (installed automatically via `just install`)
 
 ## License
 

@@ -5,6 +5,8 @@ from pydantic import BaseModel, Field
 class Post(BaseModel):
     linkedin_url: Optional[str] = None
     urn: Optional[str] = None
+    author_name: Optional[str] = None
+    author_url: Optional[str] = None
     text: Optional[str] = None
     posted_date: Optional[str] = None
     reactions_count: Optional[int] = None

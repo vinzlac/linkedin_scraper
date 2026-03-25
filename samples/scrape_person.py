@@ -5,14 +5,28 @@ Example: Scrape a single LinkedIn profile
 This example shows how to use the PersonScraper to scrape a LinkedIn profile.
 """
 import asyncio
+import sys
 from linkedin_scraper.scrapers.person import PersonScraper
 from linkedin_scraper.core.browser import BrowserManager
 
 
+def _parse_url(arg: str) -> str:
+    """Accept either a full URL or just the profile slug (e.g. 'williamhgates')."""
+    if arg.startswith("http"):
+        return arg.rstrip("/") + "/"
+    return f"https://www.linkedin.com/in/{arg.strip('/')}/"
+
+
 async def main():
     """Scrape a single person profile"""
-    profile_url = "https://www.linkedin.com/in/williamhgates/"
-    
+    if len(sys.argv) < 2:
+        print("Usage: uv run python samples/scrape_person.py <url-or-slug>")
+        print("  e.g: uv run python samples/scrape_person.py williamhgates")
+        print("  e.g: uv run python samples/scrape_person.py https://www.linkedin.com/in/williamhgates/")
+        sys.exit(1)
+
+    profile_url = _parse_url(sys.argv[1])
+
     # Initialize and start browser using context manager
     async with BrowserManager(headless=False) as browser:
         # Load existing session (must be created first - see README for setup)
