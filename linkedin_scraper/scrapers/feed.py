@@ -128,22 +128,70 @@ class FeedScraper(BaseScraper):
                 if (seenContainers.indexOf(el) >= 0) continue;
                 seenContainers.push(el);
 
-                // ---- URN extraction (5 strategies) ----
+                // ---- URN + permalink URL extraction ----
                 var urn = "";
+                var permalinkUrl = "";
+
+                // Strategy 0: data-urn attribute — LinkedIn's stable anchor per CLAUDE.md
+                var urnEls = el.querySelectorAll("[data-urn]");
+                for (var i = 0; i < urnEls.length && !urn; i++) {
+                    var du = urnEls[i].getAttribute("data-urn") || "";
+                    var m = du.match(/urn:li:activity:(\\d+)/);
+                    if (m) urn = m[0];
+                }
+                if (!urn) {
+                    var du = el.getAttribute("data-urn") || "";
+                    var m = du.match(/urn:li:activity:(\\d+)/);
+                    if (m) urn = m[0];
+                }
+
                 var compEls = el.querySelectorAll("[componentkey]");
 
+                if (!urn) {
                 for (var i = 0; i < compEls.length && !urn; i++) {
                     var ck = compEls[i].getAttribute("componentkey") || "";
                     var m = ck.match(/urn:li:activity:(\\d+)/);
                     if (m) urn = m[0];
                 }
+                }
 
-                if (!urn) {
+                // Strategy 2: /posts/ permalink — captures the canonical URL directly
+                if (!urn || !permalinkUrl) {
                     var postLinks = el.querySelectorAll("a[href*='/posts/']");
-                    for (var i = 0; i < postLinks.length && !urn; i++) {
+                    for (var i = 0; i < postLinks.length; i++) {
                         var href = postLinks[i].getAttribute("href") || "";
-                        var m = href.match(/activity-(\\d{15,})-/);
-                        if (m) urn = "urn:li:activity:" + m[1];
+                        // Strip query string for clean URL
+                        var cleanHref = href.split("?")[0];
+                        if (!permalinkUrl && cleanHref.includes("/posts/")) {
+                            permalinkUrl = cleanHref.startsWith("http")
+                                ? cleanHref
+                                : "https://www.linkedin.com" + cleanHref;
+                        }
+                        if (!urn) {
+                            var m = href.match(/activity-(\\d{15,})-/);
+                            if (m) urn = "urn:li:activity:" + m[1];
+                        }
+                        if (urn && permalinkUrl) break;
+                    }
+                }
+
+                // Strategy 3: /feed/update/ permalink — LinkedIn's standard share URL format,
+                // also used as the timestamp anchor link
+                if (!urn || !permalinkUrl) {
+                    var feedLinks = el.querySelectorAll("a[href*='/feed/update/']");
+                    for (var i = 0; i < feedLinks.length; i++) {
+                        var href = feedLinks[i].getAttribute("href") || "";
+                        var cleanHref = href.split("?")[0];
+                        var m = cleanHref.match(/urn:li:activity:(\\d+)/);
+                        if (m) {
+                            if (!urn) urn = "urn:li:activity:" + m[1];
+                            if (!permalinkUrl) {
+                                permalinkUrl = cleanHref.startsWith("http")
+                                    ? cleanHref
+                                    : "https://www.linkedin.com" + cleanHref;
+                            }
+                        }
+                        if (urn && permalinkUrl) break;
                     }
                 }
 
@@ -183,17 +231,36 @@ class FeedScraper(BaseScraper):
                 ) continue;
 
                 // ---- Detect activity post (liked/commented/reshared) ----
-                // allLines[1] = "X a commenté ce contenu" or "X aime ce contenu"
-                // Extract the action-taker's name to skip their profile links.
+                // allLines[1] = "Y a commenté ce contenu" / "Y aime ce contenu"
+                // Y = actor (network contact who triggered the feed entry)
+                // X = original author (the person who wrote the post)
+                var actorName = "";
+                var actorUrl = "";
                 var actionTakerName = "";
                 var line1 = (allLines[1] || "");
                 var actKwPat = /\\s(a\\s+comment|a\\s+r\u00e9pondu|a\\s+republi|aime\\s|a\\s+aim|a\\s+r\u00e9agi|a\\s+partag|commented|liked|reshared|reposted|reacted)/i;
                 var actMatch = line1.match(actKwPat);
                 if (actMatch && actMatch.index > 0) {
                     actionTakerName = line1.substring(0, actMatch.index).trim().toLowerCase();
+                    // Resolve actor's profile URL from the first /in/ link that matches their name
+                    var inLinksAll = el.querySelectorAll("a[href*='/in/']");
+                    for (var i = 0; i < inLinksAll.length && !actorUrl; i++) {
+                        var href = inLinksAll[i].getAttribute("href") || "";
+                        var m = href.match(/[/]in[/][^/?#]+/);
+                        if (!m) continue;
+                        var nameSpan = inLinksAll[i].querySelector("span[aria-hidden='true']");
+                        var rawText = nameSpan ? (nameSpan.innerText || "").trim() : (inLinksAll[i].innerText || "").trim();
+                        var candidate = rawText.split("\\n")[0].trim()
+                            .replace(/\\s*[^\\w\\s]\\s*(\\d+e(\\s+et\\s+\\+)?|Suivi|Following)[\\s\\S]*$/, "").trim();
+                        if (candidate.toLowerCase() === actionTakerName) {
+                            actorName = candidate;
+                            actorUrl = "https://www.linkedin.com" + m[0];
+                        }
+                    }
+                    if (!actorName) actorName = line1.substring(0, actMatch.index).trim();
                 }
 
-                // ---- Author (person then company fallback) ----
+                // ---- Author (original content creator) ----
                 var authorName = "";
                 var authorUrl = "";
                 var inLinks = el.querySelectorAll("a[href*='/in/']");
@@ -224,7 +291,6 @@ class FeedScraper(BaseScraper):
                         authorName = candidate;
                     }
                 }
-                // Fallback: extract name from allLines structure when no profile link found
                 if (!authorName) {
                     var fallback = actionTakerName ? (allLines[2] || "") : (allLines[1] || "");
                     fallback = fallback.replace(/\\s*(a\\s+|aime|comment|publi|r\u00e9agi).*$/i, "").trim();
@@ -311,11 +377,23 @@ class FeedScraper(BaseScraper):
                 content = content.slice(0, 3000);
 
                 // ---- Images ----
+                // Collect LinkedIn CDN image URLs (feedshare images, not avatars/logos).
+                // LinkedIn lazy-loads images via data-delayed-url or data-src before setting src.
                 var images = [];
-                var imgs = el.querySelectorAll("img[src]");
-                for (var i = 0; i < imgs.length; i++) {
-                    var src = imgs[i].src || "";
-                    if (src.includes("media") && !src.includes("profile") && !src.includes("logo")) {
+                var seenImgUrls = {};
+                var imgEls = el.querySelectorAll("img");
+                for (var i = 0; i < imgEls.length; i++) {
+                    var src = imgEls[i].getAttribute("data-delayed-url") ||
+                              imgEls[i].getAttribute("data-src") ||
+                              imgEls[i].getAttribute("src") || "";
+                    if (!src) continue;
+                    // Only keep LinkedIn media CDN images; skip avatars and logos
+                    if (!src.includes("media.licdn.com")) continue;
+                    if (src.includes("/profile-") || src.includes("ghost-") ||
+                        src.includes("/company-logo") || src.includes("logo")) continue;
+                    var cleanSrc = src.split("?")[0];
+                    if (!seenImgUrls[cleanSrc]) {
+                        seenImgUrls[cleanSrc] = true;
                         images.push(src);
                     }
                 }
@@ -356,15 +434,69 @@ class FeedScraper(BaseScraper):
                     }
                 }
 
+                // ---- Video ----
+                // 1. Native LinkedIn video: <video> element with data-sources JSON or src
+                // 2. External embed: <iframe> with youtube.com/embed or similar
+                // Note: native LinkedIn video URLs require auth cookies to stream outside LinkedIn.
+                var videoUrl = "";
+                var videoEl = el.querySelector("video");
+                if (videoEl) {
+                    // data-sources is a JSON array of {src, type} objects
+                    var dataSources = videoEl.getAttribute("data-sources") || "";
+                    if (dataSources) {
+                        try {
+                            var sources = JSON.parse(dataSources);
+                            // Prefer MP4, then DASH (.mpd), then HLS (.m3u8)
+                            var mp4 = "", dash = "", hls = "";
+                            for (var si = 0; si < sources.length; si++) {
+                                var s = sources[si].src || "";
+                                if (!mp4 && s.includes(".mp4")) mp4 = s;
+                                if (!dash && s.includes(".mpd")) dash = s;
+                                if (!hls && s.includes(".m3u8")) hls = s;
+                            }
+                            videoUrl = mp4 || dash || hls || (sources[0] && sources[0].src) || "";
+                        } catch(e) {}
+                    }
+                    if (!videoUrl) {
+                        videoUrl = videoEl.getAttribute("src") ||
+                                   videoEl.querySelector("source") && videoEl.querySelector("source").getAttribute("src") || "";
+                    }
+                }
+                // External embed (YouTube, Vimeo, etc.)
+                if (!videoUrl) {
+                    var iframeEl = el.querySelector("iframe[src]");
+                    if (iframeEl) videoUrl = iframeEl.getAttribute("src") || "";
+                }
+                // Reject blob: URLs — they are browser-internal and not portable
+                if (videoUrl.startsWith("blob:")) videoUrl = "";
+
+                // ---- External link (lnkd.in shortlinks and other non-LinkedIn URLs) ----
+                // Collect first external link for article_url; lnkd.in ones are resolved in Python.
+                var externalUrl = "";
+                var allLinks = el.querySelectorAll("a[href]");
+                for (var i = 0; i < allLinks.length && !externalUrl; i++) {
+                    var href = allLinks[i].getAttribute("href") || "";
+                    if (!href || href.startsWith("#") || href.startsWith("javascript")) continue;
+                    var full = href.startsWith("http") ? href : "https://www.linkedin.com" + href;
+                    // Skip LinkedIn-internal URLs; keep external ones and lnkd.in shortlinks
+                    if (full.includes("linkedin.com") && !full.includes("lnkd.in")) continue;
+                    externalUrl = full;
+                }
+
                 results.push({
                     urn: urn,
+                    permalinkUrl: permalinkUrl,
                     authorName: authorName,
                     authorUrl: authorUrl,
+                    actorName: actorName,
+                    actorUrl: actorUrl,
                     publishedAt: publishedAt,
                     content: content,
                     reactionsText: reactionsText,
                     commentsText: commentsText,
                     images: images,
+                    videoUrl: videoUrl,
+                    externalUrl: externalUrl,
                 });
             }
 
@@ -373,25 +505,49 @@ class FeedScraper(BaseScraper):
 
         result: List[Post] = []
         for data in posts_data:
+            urn = data["urn"]
+            permalink = data.get("permalinkUrl") or None
+            if not permalink and urn.startswith("urn:li:activity:"):
+                permalink = f"https://www.linkedin.com/feed/update/{urn}/"
+
+            external_url = data.get("externalUrl") or None
+            if external_url:
+                external_url = await self._resolve_url(external_url)
+
             post = Post(
-                linkedin_url=(
-                    f"https://www.linkedin.com/feed/update/{data['urn']}/"
-                    if data["urn"].startswith("urn:li:activity:")
-                    else None
-                ),
-                urn=data["urn"],
+                linkedin_url=permalink,
+                urn=urn,
                 author_name=data.get("authorName") or None,
                 author_url=data.get("authorUrl") or None,
+                actor_name=data.get("actorName") or None,
+                actor_url=data.get("actorUrl") or None,
                 text=data.get("content") or None,
                 posted_date=self._clean_date(data.get("publishedAt", "")),
                 reactions_count=self._parse_count(data.get("reactionsText", "")),
                 comments_count=self._parse_count(data.get("commentsText", "")),
                 reposts_count=self._parse_count(data.get("repostsText", "")),
                 image_urls=data.get("images", []),
+                video_url=data.get("videoUrl") or None,
+                article_url=external_url,
             )
             result.append(post)
 
         return result
+
+    async def _resolve_url(self, url: str) -> str:
+        """Follow redirects (e.g. lnkd.in shortlinks) and return the final destination URL."""
+        try:
+            response = await self.page.request.get(
+                url,
+                max_redirects=10,
+                timeout=8000,
+            )
+            final_url = response.url
+            await response.dispose()
+            return final_url or url
+        except Exception as e:
+            logger.debug(f"Could not resolve URL {url}: {e}")
+            return url
 
     def _clean_date(self, text: str) -> Optional[str]:
         if not text:

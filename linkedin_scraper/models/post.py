@@ -7,6 +7,10 @@ class Post(BaseModel):
     urn: Optional[str] = None
     author_name: Optional[str] = None
     author_url: Optional[str] = None
+    # For activity posts ("Y a liké/commenté/republié ce contenu de X"):
+    # actor_name/actor_url = Y (the network contact who triggered the feed appearance)
+    actor_name: Optional[str] = None
+    actor_url: Optional[str] = None
     text: Optional[str] = None
     posted_date: Optional[str] = None
     reactions_count: Optional[int] = None

@@ -29,14 +29,21 @@ async def main():
 
         for i, post in enumerate(posts, 1):
             print(f"\nPost {i}:")
-            print(f"  Author  : {post.author_name}")
+            if post.actor_name:
+                print(f"  Via     : {post.actor_name} ({post.actor_url})")
+            print(f"  Author  : {post.author_name} ({post.author_url})")
             print(f"  URL     : {post.linkedin_url}")
             print(f"  Posted  : {post.posted_date}")
-            print(f"  React   : {post.reactions_count}")
-            print(f"  Comments: {post.comments_count}")
+            print(f"  React   : {post.reactions_count}  Comments: {post.comments_count}")
+            if post.video_url:
+                print(f"  Video   : {post.video_url}")
+            if post.article_url:
+                print(f"  Link    : {post.article_url}")
+            if post.image_urls:
+                for img_url in post.image_urls:
+                    print(f"  Image   : {img_url}")
             if post.text:
-                preview = post.text[:200] + "..." if len(post.text) > 200 else post.text
-                print(f"  Text    : {preview}")
+                print(f"  Text    :\n{post.text}")
             print("-" * 40)
 
         print("\nDone!")
