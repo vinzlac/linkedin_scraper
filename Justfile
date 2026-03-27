@@ -53,9 +53,13 @@ check: fmt-check lint test
 session:
     uv run python samples/create_session.py
 
-# Run the feed scraper sample
-run-feed:
-    uv run python samples/scrape_feed.py
+# Scrape N posts from your LinkedIn feed (default: 10)
+run-feed N="10":
+    uv run python samples/scrape_feed.py {{ N }}
+
+# Debug DOM structure of LinkedIn feed
+debug-feed:
+    uv run python samples/debug_feed.py
 
 # Scrape a LinkedIn profile (URL or slug)
 run-person PROFILE:
