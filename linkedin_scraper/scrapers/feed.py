@@ -109,6 +109,60 @@ class FeedScraper(BaseScraper):
             // isDegree: short line like "• 2e" or "• 3e et +" (degree indicator in reshared headers)
             function isDegree(line) { return line.length < 16 && /\\d+e(\\s+et\\s+\\+)?$/.test(line); }
 
+            function normalizeLinkedInHref(href) {
+                if (!href) return "";
+                var s = String(href).trim();
+                if (!s) return "";
+                if (s.indexOf("//") === 0) return "https:" + s;
+                if (s.indexOf("http") === 0) return s;
+                if (s.charAt(0) === "/") return "https://www.linkedin.com" + s;
+                return "";
+            }
+            function ensureTrailingSlashOnFeedUpdate(url) {
+                if (!url || url.indexOf("/feed/update/") === -1) return url;
+                return url.charAt(url.length - 1) === "/" ? url : url + "/";
+            }
+            /** Prefer direct post URL from DOM (href); works when internal URN is urn:li:compkey:… */
+            function extractPermalinkFromContainer(root) {
+                if (!root) return "";
+                var links = root.querySelectorAll("a[href]");
+                var i, raw, k, variants, v, pathOnly, full;
+                for (i = 0; i < links.length; i++) {
+                    raw = links[i].getAttribute("href") || "";
+                    if (!raw) continue;
+                    variants = [raw];
+                    try { variants.push(decodeURIComponent(raw)); } catch (eDec) {}
+                    for (k = 0; k < variants.length; k++) {
+                        v = variants[k];
+                        if (v.indexOf("/feed/update/") === -1) continue;
+                        pathOnly = v.split("#")[0].split("?")[0];
+                        full = normalizeLinkedInHref(pathOnly);
+                        if (full && /urn:li:activity:\\d+/.test(full)) {
+                            return ensureTrailingSlashOnFeedUpdate(full);
+                        }
+                    }
+                }
+                // href may carry URN only after decoding; strip query for path check
+                for (i = 0; i < links.length; i++) {
+                    raw = links[i].getAttribute("href") || "";
+                    if (!raw) continue;
+                    try { v = decodeURIComponent(raw.split("#")[0]); } catch (e2) { v = raw.split("#")[0]; }
+                    if (v.indexOf("/feed/update/") === -1) continue;
+                    if (/urn:li:activity:\\d+/.test(v)) {
+                        full = normalizeLinkedInHref(v.split("?")[0]);
+                        if (full) return ensureTrailingSlashOnFeedUpdate(full);
+                    }
+                }
+                for (i = 0; i < links.length; i++) {
+                    raw = links[i].getAttribute("href") || "";
+                    if (!raw) continue;
+                    pathOnly = raw.split("#")[0].split("?")[0];
+                    full = normalizeLinkedInHref(pathOnly);
+                    if (full && full.indexOf("/posts/") !== -1) return full;
+                }
+                return "";
+            }
+
             for (var bi = 0; bi < repostBtns.length; bi++) {
                 var btn = repostBtns[bi];
 
@@ -129,8 +183,9 @@ class FeedScraper(BaseScraper):
                 seenContainers.push(el);
 
                 // ---- URN + permalink URL extraction ----
+                // DOM permalink first (handles urn:li:compkey when href still points to activity URL)
                 var urn = "";
-                var permalinkUrl = "";
+                var permalinkUrl = extractPermalinkFromContainer(el);
 
                 // Strategy 0: data-urn attribute — LinkedIn's stable anchor per CLAUDE.md
                 var urnEls = el.querySelectorAll("[data-urn]");
@@ -483,6 +538,10 @@ class FeedScraper(BaseScraper):
                     externalUrl = full;
                 }
 
+                if (!permalinkUrl) {
+                    permalinkUrl = extractPermalinkFromContainer(el);
+                }
+
                 results.push({
                     urn: urn,
                     permalinkUrl: permalinkUrl,
@@ -507,15 +566,14 @@ class FeedScraper(BaseScraper):
         for data in posts_data:
             urn = data["urn"]
             permalink = data.get("permalinkUrl") or None
-            if not permalink and urn.startswith("urn:li:activity:"):
-                permalink = f"https://www.linkedin.com/feed/update/{urn}/"
+            linkedin_url = self._finalize_linkedin_url(permalink, urn)
 
             external_url = data.get("externalUrl") or None
             if external_url:
                 external_url = await self._resolve_url(external_url)
 
             post = Post(
-                linkedin_url=permalink,
+                linkedin_url=linkedin_url,
                 urn=urn,
                 author_name=data.get("authorName") or None,
                 author_url=data.get("authorUrl") or None,
@@ -533,6 +591,20 @@ class FeedScraper(BaseScraper):
             result.append(post)
 
         return result
+
+    @staticmethod
+    def _finalize_linkedin_url(
+        permalink: Optional[str],
+        urn: str,
+    ) -> Optional[str]:
+        """Prefer URL from DOM; else build from activity URN; normalize /feed/update/ trailing slash."""
+        raw = (permalink or "").strip()
+        url = raw if raw else None
+        if not url and urn.startswith("urn:li:activity:"):
+            url = f"https://www.linkedin.com/feed/update/{urn}/"
+        if url and "/feed/update/" in url and not url.endswith("/"):
+            url = f"{url}/"
+        return url
 
     async def _resolve_url(self, url: str) -> str:
         """Follow redirects (e.g. lnkd.in shortlinks) and return the final destination URL."""

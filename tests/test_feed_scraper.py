@@ -37,6 +37,20 @@ class TestFeedScraperUnit:
         assert scraper._parse_count("") is None
         assert scraper._parse_count(None) is None
 
+    def test_finalize_linkedin_url_prefers_dom_over_compkey_urn(self):
+        scraper = self._make_scraper()
+        assert scraper._finalize_linkedin_url(
+            "https://www.linkedin.com/feed/update/urn:li:activity:999/",
+            "urn:li:compkey:expandedFeedType_xyz",
+        ) == "https://www.linkedin.com/feed/update/urn:li:activity:999/"
+
+    def test_finalize_linkedin_url_adds_trailing_slash_on_feed_update(self):
+        scraper = self._make_scraper()
+        assert scraper._finalize_linkedin_url(
+            "https://www.linkedin.com/feed/update/urn:li:activity:1",
+            "urn:li:compkey:x",
+        ) == "https://www.linkedin.com/feed/update/urn:li:activity:1/"
+
     @pytest.mark.asyncio
     async def test_scroll_for_more_posts_uses_mouse_wheel(self):
         scraper = self._make_scraper()
@@ -79,6 +93,34 @@ class TestFeedScraperUnit:
         assert post.reposts_count == 3
         assert post.posted_date == "2h"
         assert post.linkedin_url == "https://www.linkedin.com/feed/update/urn:li:activity:123456/"
+
+    @pytest.mark.asyncio
+    async def test_extract_posts_compkey_urn_uses_permalink_from_dom(self):
+        scraper = self._make_scraper()
+        scraper.page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "urn": "urn:li:compkey:expandedSomeComponentKey",
+                    "permalinkUrl": "https://www.linkedin.com/feed/update/urn:li:activity:777888999/",
+                    "authorName": "Camille",
+                    "authorUrl": "https://www.linkedin.com/in/camille/",
+                    "content": "Texte du post avec urn interne compkey mais URL activity dans le DOM.",
+                    "publishedAt": "1 j",
+                    "reactionsText": "10",
+                    "commentsText": "2",
+                    "repostsText": "",
+                    "images": [],
+                }
+            ]
+        )
+
+        posts = await scraper._extract_posts_from_feed()
+        assert len(posts) == 1
+        assert posts[0].urn == "urn:li:compkey:expandedSomeComponentKey"
+        assert (
+            posts[0].linkedin_url
+            == "https://www.linkedin.com/feed/update/urn:li:activity:777888999/"
+        )
 
     @pytest.mark.asyncio
     async def test_extract_posts_empty_author_becomes_none(self):
