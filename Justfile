@@ -57,6 +57,11 @@ session:
 run-feed N="10":
     uv run python samples/scrape_feed.py {{ N }}
 
+# Scrape N posts from feed using a virtual display (for Linux servers without a GUI)
+# Requires: sudo apt install xvfb
+run-feed-xvfb N="10":
+    xvfb-run --server-args="-screen 0 1280x720x24" uv run python samples/scrape_feed.py {{ N }}
+
 # Debug DOM structure of LinkedIn feed
 debug-feed:
     uv run python samples/debug_feed.py

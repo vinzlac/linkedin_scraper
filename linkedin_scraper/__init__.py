@@ -1,7 +1,12 @@
 """LinkedIn Scraper - Async Playwright-based scraper for LinkedIn."""
 
-# Version
-__version__ = "3.1.1"
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("linkedin_scraper")
+except PackageNotFoundError:
+    # Package not installed (running directly from source)
+    __version__ = "dev"
 
 # Core modules
 from .core import (

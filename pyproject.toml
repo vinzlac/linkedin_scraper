@@ -4,17 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "linkedin_scraper"
-version = "3.1.1"
-description = "Async LinkedIn scraper for profiles, companies, and jobs"
+version = "4.0.0"
+description = "Async LinkedIn scraper for profiles, companies, jobs and feed — Playwright-based"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache 2.0" }
 authors = [
-    { name = "Joey Sham", email = "sham.joey@gmail.com" },
+    { name = "Vincent Lacombe" },
 ]
-keywords = ["linkedin", "scraping", "scraper", "async", "playwright", "profiles"]
+keywords = ["linkedin", "scraping", "scraper", "async", "playwright", "feed", "profiles", "mcp"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
@@ -37,10 +37,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/joeyism/linkedin_scraper"
-Documentation = "https://github.com/joeyism/linkedin_scraper#readme"
-Repository = "https://github.com/joeyism/linkedin_scraper"
-Issues = "https://github.com/joeyism/linkedin_scraper/issues"
+Homepage = "https://github.com/vinzlac/linkedin_scraper"
+Documentation = "https://github.com/vinzlac/linkedin_scraper#readme"
+Repository = "https://github.com/vinzlac/linkedin_scraper"
+Issues = "https://github.com/vinzlac/linkedin_scraper/issues"
 
 [dependency-groups]
 dev = [
