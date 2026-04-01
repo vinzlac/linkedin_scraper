@@ -1,6 +1,7 @@
 import logging
 import re
-from typing import List, Optional
+from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from ..models.post import Post
@@ -122,11 +123,33 @@ class FeedScraper(BaseScraper):
                 if (!url || url.indexOf("/feed/update/") === -1) return url;
                 return url.charAt(url.length - 1) === "/" ? url : url + "/";
             }
-            /** Prefer direct post URL from DOM (href); works when internal URN is urn:li:compkey:… */
+            /** Activity numeric id from any string (href with query, encoded URN, /posts/ slug). */
+            function extractActivityIdFromText(text) {
+                if (!text) return "";
+                var t = String(text);
+                var dec = t;
+                try { dec = decodeURIComponent(t); } catch (e0) { dec = t; }
+                var m = dec.match(/urn:li:activity:(\\d+)/) || t.match(/urn:li:activity:(\\d+)/);
+                if (m) return m[1];
+                m = dec.match(/activity-(\\d{10,})-/) || t.match(/activity-(\\d{10,})-/);
+                if (m) return m[1];
+                return "";
+            }
+            function feedUpdatePermalinkFromActivityId(id) {
+                if (!id) return "";
+                return ensureTrailingSlashOnFeedUpdate(
+                    "https://www.linkedin.com/feed/update/urn:li:activity:" + id
+                );
+            }
+            /**
+             * Prefer direct post URL from DOM (href). Handles compkey cards when activity sits in
+             * query params, reposts (several ids — prefer /feed/update/ or /posts/), data-urn, innerHTML.
+             */
             function extractPermalinkFromContainer(root) {
                 if (!root) return "";
                 var links = root.querySelectorAll("a[href]");
                 var i, raw, k, variants, v, pathOnly, full;
+                // 1) Canonical /feed/update/… path with activity in path
                 for (i = 0; i < links.length; i++) {
                     raw = links[i].getAttribute("href") || "";
                     if (!raw) continue;
@@ -142,7 +165,6 @@ class FeedScraper(BaseScraper):
                         }
                     }
                 }
-                // href may carry URN only after decoding; strip query for path check
                 for (i = 0; i < links.length; i++) {
                     raw = links[i].getAttribute("href") || "";
                     if (!raw) continue;
@@ -153,6 +175,7 @@ class FeedScraper(BaseScraper):
                         if (full) return ensureTrailingSlashOnFeedUpdate(full);
                     }
                 }
+                // 2) /posts/… slugs
                 for (i = 0; i < links.length; i++) {
                     raw = links[i].getAttribute("href") || "";
                     if (!raw) continue;
@@ -160,7 +183,124 @@ class FeedScraper(BaseScraper):
                     full = normalizeLinkedInHref(pathOnly);
                     if (full && full.indexOf("/posts/") !== -1) return full;
                 }
+                // 3) Activity id anywhere in href (query string, encoded) — typical for newer cards / reposts
+                var candidates = [];
+                for (i = 0; i < links.length; i++) {
+                    raw = links[i].getAttribute("href") || "";
+                    var aid = extractActivityIdFromText(raw);
+                    if (aid) candidates.push({ id: aid, href: raw });
+                }
+                if (candidates.length === 1) {
+                    return feedUpdatePermalinkFromActivityId(candidates[0].id);
+                }
+                if (candidates.length > 1) {
+                    for (k = 0; k < candidates.length; k++) {
+                        if (candidates[k].href.indexOf("/feed/update/") !== -1) {
+                            return feedUpdatePermalinkFromActivityId(candidates[k].id);
+                        }
+                    }
+                    try {
+                        var decH = "";
+                        for (k = 0; k < candidates.length; k++) {
+                            try { decH = decodeURIComponent(candidates[k].href); } catch (eH) { decH = candidates[k].href; }
+                            if (decH.indexOf("/feed/update/") !== -1) {
+                                return feedUpdatePermalinkFromActivityId(candidates[k].id);
+                            }
+                        }
+                    } catch (eK) {}
+                    for (k = 0; k < candidates.length; k++) {
+                        if (candidates[k].href.indexOf("/posts/") !== -1) {
+                            return feedUpdatePermalinkFromActivityId(candidates[k].id);
+                        }
+                    }
+                    return feedUpdatePermalinkFromActivityId(candidates[candidates.length - 1].id);
+                }
+                // 4) data-urn descendants (may expose activity while card URN stays compkey)
+                var duNodes = root.querySelectorAll("[data-urn]");
+                for (i = 0; i < duNodes.length; i++) {
+                    var du = duNodes[i].getAttribute("data-urn") || "";
+                    var aidDu = extractActivityIdFromText(du);
+                    if (aidDu) return feedUpdatePermalinkFromActivityId(aidDu);
+                }
+                // 5) Last activity URN in subtree HTML (repost: nested original often appears after header chrome)
+                var html = root.innerHTML || "";
+                var reGlob = /urn:li:activity:(\\d+)/g;
+                var mm;
+                var lastId = "";
+                while ((mm = reGlob.exec(html)) !== null) {
+                    lastId = mm[1];
+                }
+                if (lastId) return feedUpdatePermalinkFromActivityId(lastId);
                 return "";
+            }
+            function pushUnique(arr, value) {
+                if (!value) return;
+                if (arr.indexOf(value) === -1) arr.push(value);
+            }
+            function collectIdentifiersAndPermalinkCandidates(root, baseUrn, basePermalink, compEls) {
+                var identifierCandidates = [];
+                var permalinkCandidates = [];
+                var componentKeys = [];
+
+                if (baseUrn) pushUnique(identifierCandidates, baseUrn);
+                if (basePermalink) pushUnique(permalinkCandidates, ensureTrailingSlashOnFeedUpdate(basePermalink));
+
+                // component keys (raw + normalized compkey urn)
+                for (var i = 0; i < compEls.length; i++) {
+                    var ck = compEls[i].getAttribute("componentkey") || "";
+                    if (!ck) continue;
+                    pushUnique(componentKeys, ck);
+                    var base = ck.replace(/^expanded/, "").replace(/FeedType_.*$/, "");
+                    if (base.length > 10) {
+                        pushUnique(identifierCandidates, "urn:li:compkey:" + base);
+                    }
+                    var aidCk = extractActivityIdFromText(ck);
+                    if (aidCk) pushUnique(identifierCandidates, "urn:li:activity:" + aidCk);
+                }
+
+                // data-urn and other attrs
+                var duNodes = root.querySelectorAll("[data-urn]");
+                for (var j = 0; j < duNodes.length; j++) {
+                    var du = duNodes[j].getAttribute("data-urn") || "";
+                    if (!du) continue;
+                    var aidDu = extractActivityIdFromText(du);
+                    if (aidDu) {
+                        pushUnique(identifierCandidates, "urn:li:activity:" + aidDu);
+                        pushUnique(permalinkCandidates, feedUpdatePermalinkFromActivityId(aidDu));
+                    }
+                }
+
+                // href-based candidates
+                var links = root.querySelectorAll("a[href]");
+                for (var k = 0; k < links.length; k++) {
+                    var href = links[k].getAttribute("href") || "";
+                    if (!href) continue;
+                    var fullHref = normalizeLinkedInHref(href) || normalizeLinkedInHref(href.split("?")[0]);
+                    if (fullHref && (fullHref.indexOf("/feed/update/") !== -1 || fullHref.indexOf("/posts/") !== -1)) {
+                        pushUnique(permalinkCandidates, ensureTrailingSlashOnFeedUpdate(fullHref.split("#")[0]));
+                    }
+                    var aidHref = extractActivityIdFromText(href);
+                    if (aidHref) {
+                        pushUnique(identifierCandidates, "urn:li:activity:" + aidHref);
+                        pushUnique(permalinkCandidates, feedUpdatePermalinkFromActivityId(aidHref));
+                    }
+                }
+
+                // last resort: activity IDs in HTML
+                var html = root.innerHTML || "";
+                var reGlob = /urn:li:activity:(\\d+)/g;
+                var mm;
+                while ((mm = reGlob.exec(html)) !== null) {
+                    var urnA = "urn:li:activity:" + mm[1];
+                    pushUnique(identifierCandidates, urnA);
+                    pushUnique(permalinkCandidates, feedUpdatePermalinkFromActivityId(mm[1]));
+                }
+
+                return {
+                    identifierCandidates: identifierCandidates,
+                    permalinkCandidates: permalinkCandidates,
+                    componentKeys: componentKeys,
+                };
             }
 
             for (var bi = 0; bi < repostBtns.length; bi++) {
@@ -541,10 +681,14 @@ class FeedScraper(BaseScraper):
                 if (!permalinkUrl) {
                     permalinkUrl = extractPermalinkFromContainer(el);
                 }
+                var debugCandidates = collectIdentifiersAndPermalinkCandidates(el, urn, permalinkUrl, compEls);
 
                 results.push({
                     urn: urn,
                     permalinkUrl: permalinkUrl,
+                    identifierCandidates: debugCandidates.identifierCandidates,
+                    permalinkCandidates: debugCandidates.permalinkCandidates,
+                    componentKeys: debugCandidates.componentKeys,
                     authorName: authorName,
                     authorUrl: authorUrl,
                     actorName: actorName,
@@ -561,12 +705,14 @@ class FeedScraper(BaseScraper):
 
             return results;
         }""")
+        posts_data = await self._fill_missing_permalinks_from_ui(posts_data)
 
         result: List[Post] = []
         for data in posts_data:
             urn = data["urn"]
             permalink = data.get("permalinkUrl") or None
-            linkedin_url = self._finalize_linkedin_url(permalink, urn)
+            permalink_candidates = data.get("permalinkCandidates", []) or []
+            linkedin_url = self._finalize_linkedin_url(permalink, urn, permalink_candidates)
 
             external_url = data.get("externalUrl") or None
             if external_url:
@@ -575,6 +721,11 @@ class FeedScraper(BaseScraper):
             post = Post(
                 linkedin_url=linkedin_url,
                 urn=urn,
+                identifier_candidates=data.get("identifierCandidates", []),
+                permalink_candidates=permalink_candidates,
+                component_keys=data.get("componentKeys", []),
+                ui_permalink_fallback_status=data.get("uiPermalinkFallbackStatus") or None,
+                ui_permalink_fallback_error=data.get("uiPermalinkFallbackError") or None,
                 author_name=data.get("authorName") or None,
                 author_url=data.get("authorUrl") or None,
                 actor_name=data.get("actorName") or None,
@@ -592,14 +743,336 @@ class FeedScraper(BaseScraper):
 
         return result
 
+    async def _fill_missing_permalinks_from_ui(
+        self,
+        posts_data: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Try to recover missing permalinks via resilient UI interactions.
+
+        This is a best-effort fallback for feed cards exposing only `compkey` in DOM.
+        It must never fail scraping: errors are returned in per-post attributes.
+        """
+        for data in posts_data:
+            if data.get("permalinkUrl"):
+                data["uiPermalinkFallbackStatus"] = "not_needed"
+                continue
+
+            data["uiPermalinkFallbackStatus"] = "no_permalink_found"
+            errors: List[str] = []
+            component_keys = data.get("componentKeys", []) or []
+
+            # Keep only likely card-level keys (skip random UUID-like component keys).
+            card_keys: List[str] = []
+            for key in component_keys:
+                if not isinstance(key, str):
+                    continue
+                base = key.replace("expanded", "")
+                if "FeedType_" in base:
+                    base = base.split("FeedType_", 1)[0]
+                if len(base) < 16:
+                    continue
+                if base.count("-") >= 4:
+                    continue
+                if base not in card_keys:
+                    card_keys.append(base)
+
+            card_locator = None
+            for key in card_keys:
+                try:
+                    locator = self.page.locator(f'[componentkey*="{key}"]').first
+                    count = await locator.count()
+                    if count > 0:
+                        card_locator = locator
+                        break
+                except Exception as e:
+                    errors.append(f"card_lookup_failed:{e}")
+
+            if card_locator is None:
+                data["uiPermalinkFallbackError"] = "; ".join(errors + ["card_not_found"])
+                continue
+
+            # 1) Liens uniquement dans la carte (sans menu) — évite les faux positifs globaux
+            card_dom_candidates: List[str] = []
+            try:
+                card_dom_candidates = await card_locator.evaluate(
+                    """(root) => {
+                        function abs(href) {
+                            if (!href) return "";
+                            if (href.startsWith("//")) return "https:" + href;
+                            if (href.startsWith("http")) return href;
+                            if (href.startsWith("/")) return "https://www.linkedin.com" + href;
+                            return "";
+                        }
+                        function junk(u) {
+                            if (!u) return true;
+                            try {
+                                var p = new URL(u).pathname.replace(/\\/+$/, "");
+                                if (/^\\/company\\/[^\\/]+\\/posts$/.test(p)) return true;
+                            } catch (e) {}
+                            return false;
+                        }
+                        function addIf(list, url) {
+                            if (!url || junk(url)) return;
+                            if (url.indexOf("/feed/update/") !== -1 && url.charAt(url.length - 1) !== "/") url = url + "/";
+                            if (list.indexOf(url) === -1) list.push(url);
+                        }
+                        const out = [];
+                        const links = root.querySelectorAll("a[href]");
+                        for (var i = 0; i < links.length; i++) {
+                            var href = links[i].getAttribute("href") || "";
+                            var dec = href;
+                            try { dec = decodeURIComponent(href); } catch (e2) {}
+                            if (href.indexOf("/feed/update/") !== -1 || dec.indexOf("/feed/update/") !== -1) {
+                                var pick = dec.indexOf("/feed/update/") !== -1 ? dec : href;
+                                addIf(out, abs(pick.split("#")[0].split("?")[0]));
+                            }
+                            if (href.indexOf("/posts/") !== -1) addIf(out, abs(href.split("#")[0].split("?")[0]));
+                            var m = dec.match(/urn:li:activity:(\\d+)/) || href.match(/urn:li:activity:(\\d+)/);
+                            if (m) addIf(out, "https://www.linkedin.com/feed/update/urn:li:activity:" + m[1] + "/");
+                        }
+                        return out.slice(0, 12);
+                    }"""
+                )
+            except Exception as e:
+                errors.append(f"card_dom_scan_failed:{e}")
+
+            if card_dom_candidates:
+                data["permalinkCandidates"] = list(
+                    dict.fromkeys((data.get("permalinkCandidates", []) or []) + card_dom_candidates)
+                )
+                data["permalinkUrl"] = data["permalinkUrl"] or card_dom_candidates[0]
+                data["uiPermalinkFallbackStatus"] = "resolved_via_card_dom"
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                continue
+
+            menu_button_selectors = [
+                'button[aria-label*="Plus"]',
+                'button[aria-label*="More"]',
+                'button[aria-label*="menu"]',
+                'button[aria-label*="Menu"]',
+                'button[data-control-name*="overflow"]',
+                '[data-control-name="overflow_menu"]',
+            ]
+            menu_btn = None
+            for selector in menu_button_selectors:
+                try:
+                    candidate = card_locator.locator(selector).first
+                    if await candidate.count() and await candidate.is_visible():
+                        menu_btn = candidate
+                        break
+                except Exception:
+                    continue
+
+            if menu_btn is None:
+                data["uiPermalinkFallbackError"] = "; ".join(errors + ["menu_button_not_found"])
+                continue
+
+            try:
+                await menu_btn.click(timeout=3000)
+                await self.page.wait_for_timeout(350)
+            except Exception as e:
+                data["uiPermalinkFallbackError"] = "; ".join(errors + [f"menu_click_failed:{e}"])
+                continue
+
+            try:
+                menu_candidate = await self.page.evaluate(
+                    """() => {
+                        function abs(href) {
+                            if (!href) return "";
+                            if (href.startsWith("//")) return "https:" + href;
+                            if (href.startsWith("http")) return href;
+                            if (href.startsWith("/")) return "https://www.linkedin.com" + href;
+                            return "";
+                        }
+                        function junk(u) {
+                            if (!u) return true;
+                            try {
+                                var p = new URL(u).pathname.replace(/\\/+$/, "");
+                                if (/^\\/company\\/[^\\/]+\\/posts$/.test(p)) return true;
+                            } catch (e) {}
+                            return false;
+                        }
+                        function addIf(list, url) {
+                            if (!url || junk(url)) return;
+                            if (url.includes("/feed/update/") && !url.endsWith("/")) url = url + "/";
+                            if (!list.includes(url)) list.push(url);
+                        }
+                        const out = [];
+                        const menuRoots = Array.from(document.querySelectorAll(
+                            '[role="menu"], [data-test-artdeco-dropdown-content], .artdeco-dropdown__content--is-open, [data-floating-ui-portal] [role="menu"]'
+                        ));
+                        if (!menuRoots.length) return [];
+                        for (const root of menuRoots) {
+                            root.querySelectorAll("a[href]").forEach(function(a) {
+                                const href = a.getAttribute("href") || "";
+                                const decoded = (() => { try { return decodeURIComponent(href); } catch (_) { return href; } })();
+                                if (href.includes("/feed/update/") || decoded.includes("/feed/update/")) {
+                                    const pick = decoded.includes("/feed/update/") ? decoded : href;
+                                    addIf(out, abs(pick.split("#")[0].split("?")[0]));
+                                }
+                                if (href.includes("/posts/")) addIf(out, abs(href.split("#")[0].split("?")[0]));
+                                const m = decoded.match(/urn:li:activity:(\\d+)/) || href.match(/urn:li:activity:(\\d+)/);
+                                if (m) addIf(out, "https://www.linkedin.com/feed/update/urn:li:activity:" + m[1] + "/");
+                            });
+                        }
+                        return out.slice(0, 10);
+                    }"""
+                )
+                if menu_candidate:
+                    data["permalinkCandidates"] = list(
+                        dict.fromkeys((data.get("permalinkCandidates", []) or []) + menu_candidate)
+                    )
+                    data["permalinkUrl"] = data.get("permalinkUrl") or menu_candidate[0]
+                    data["uiPermalinkFallbackStatus"] = "resolved_via_ui_menu"
+                else:
+                    clip_url = await self._try_read_permalink_via_copy_link_menu()
+                    if clip_url:
+                        merged = (data.get("permalinkCandidates", []) or []) + [clip_url]
+                        data["permalinkCandidates"] = list(dict.fromkeys(merged))
+                        data["permalinkUrl"] = data.get("permalinkUrl") or clip_url
+                        data["uiPermalinkFallbackStatus"] = "resolved_via_copy_link_clipboard"
+                    else:
+                        data["uiPermalinkFallbackError"] = "; ".join(
+                            errors + ["menu_opened_but_no_permalink"]
+                        )
+            except Exception as e:
+                data["uiPermalinkFallbackError"] = "; ".join(errors + [f"menu_extract_failed:{e}"])
+            finally:
+                try:
+                    await self.page.keyboard.press("Escape")
+                except Exception:
+                    pass
+        return posts_data
+
+    @staticmethod
+    def _looks_like_linkedin_post_url(url: str) -> bool:
+        u = url.strip().lower()
+        if "linkedin.com" not in u:
+            return False
+        if "/feed/update/" in u or "/posts/" in u:
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_clipboard_post_url(url: str) -> str:
+        u = url.strip().splitlines()[0].strip()
+        if "/feed/update/" in u and not u.endswith("/"):
+            u = f"{u}/"
+        return u
+
+    async def _try_read_permalink_via_copy_link_menu(self) -> Optional[str]:
+        """Overflow déjà ouvert : clique « Copier le lien vers le post » et lit le presse-papiers."""
+        try:
+            for origin in ("https://www.linkedin.com", "https://linkedin.com"):
+                try:
+                    await self.page.context.grant_permissions(
+                        ["clipboard-read", "clipboard-write"],
+                        origin=origin,
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            items = (
+                self.page.locator('[role="menu"]:visible')
+                .last.locator('[role="menuitem"]')
+                .filter(
+                    has_text=re.compile(
+                        r"Copier le lien vers le post|Copier le lien|Copy link to post",
+                        re.I,
+                    )
+                )
+            )
+            if await items.count() == 0:
+                items = self.page.locator('[role="menuitem"]').filter(
+                    has_text=re.compile(
+                        r"Copier le lien vers le post|Copier le lien|Copy link to post",
+                        re.I,
+                    )
+                )
+            if await items.count() == 0:
+                return None
+            await items.last.click(timeout=5000)
+        except Exception as e:
+            logger.debug("copy_link menuitem click failed: %s", e)
+            return None
+
+        await self.page.wait_for_timeout(450)
+
+        try:
+            text = await self.page.evaluate(
+                """async () => {
+                    try {
+                        return await navigator.clipboard.readText();
+                    } catch (e) {
+                        return "";
+                    }
+                }"""
+            )
+        except Exception as e:
+            logger.debug("clipboard readText failed: %s", e)
+            return None
+
+        if not text or not isinstance(text, str):
+            return None
+
+        url = text.strip().splitlines()[0].strip()
+        if not FeedScraper._looks_like_linkedin_post_url(url):
+            return None
+        if FeedScraper._is_company_posts_feed_listing(url):
+            return None
+        return FeedScraper._normalize_clipboard_post_url(url)
+
+    @staticmethod
+    def _is_company_posts_feed_listing(url: str) -> bool:
+        """True for /company/X/posts (fil d'entreprise), not a permalink de post."""
+        try:
+            path = urlparse(url).path.rstrip("/")
+            return bool(re.match(r"^/company/[^/]+/posts$", path))
+        except Exception:
+            return False
+
     @staticmethod
     def _finalize_linkedin_url(
         permalink: Optional[str],
         urn: str,
+        permalink_candidates: List[str],
     ) -> Optional[str]:
         """Prefer URL from DOM; else build from activity URN; normalize /feed/update/ trailing slash."""
+        options = []
         raw = (permalink or "").strip()
-        url = raw if raw else None
+        if raw and not FeedScraper._is_company_posts_feed_listing(raw):
+            options.append(raw)
+        for candidate in permalink_candidates:
+            if (
+                candidate
+                and candidate not in options
+                and not FeedScraper._is_company_posts_feed_listing(candidate)
+            ):
+                options.append(candidate)
+
+        def score(candidate_url: str) -> int:
+            s = 0
+            if "/feed/update/" in candidate_url:
+                s += 100
+            if "/posts/" in candidate_url:
+                s += 70
+            if "urn:li:activity:" in candidate_url:
+                s += 50
+            if "/company/" in candidate_url and "/posts/" in candidate_url:
+                s -= 80
+            if urn.startswith("urn:li:activity:") and urn in candidate_url:
+                s += 40
+            return s
+
+        url = None
+        if options:
+            url = sorted(options, key=score, reverse=True)[0]
         if not url and urn.startswith("urn:li:activity:"):
             url = f"https://www.linkedin.com/feed/update/{urn}/"
         if url and "/feed/update/" in url and not url.endswith("/"):

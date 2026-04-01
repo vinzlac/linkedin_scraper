@@ -19,6 +19,12 @@ class Post(BaseModel):
     image_urls: List[str] = Field(default_factory=list)
     video_url: Optional[str] = None
     article_url: Optional[str] = None
+    # Extra debug/trace fields for difficult feed cards (compkey, repost wrappers, A/B layouts)
+    identifier_candidates: List[str] = Field(default_factory=list)
+    permalink_candidates: List[str] = Field(default_factory=list)
+    component_keys: List[str] = Field(default_factory=list)
+    ui_permalink_fallback_status: Optional[str] = None
+    ui_permalink_fallback_error: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()

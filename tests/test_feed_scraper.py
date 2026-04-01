@@ -42,6 +42,7 @@ class TestFeedScraperUnit:
         assert scraper._finalize_linkedin_url(
             "https://www.linkedin.com/feed/update/urn:li:activity:999/",
             "urn:li:compkey:expandedFeedType_xyz",
+            [],
         ) == "https://www.linkedin.com/feed/update/urn:li:activity:999/"
 
     def test_finalize_linkedin_url_adds_trailing_slash_on_feed_update(self):
@@ -49,6 +50,38 @@ class TestFeedScraperUnit:
         assert scraper._finalize_linkedin_url(
             "https://www.linkedin.com/feed/update/urn:li:activity:1",
             "urn:li:compkey:x",
+            [],
+        ) == "https://www.linkedin.com/feed/update/urn:li:activity:1/"
+
+    def test_finalize_linkedin_url_ignores_company_posts_feed_listing(self):
+        scraper = self._make_scraper()
+        listing = "https://www.linkedin.com/company/salon-amif/posts/"
+        good = "https://www.linkedin.com/feed/update/urn:li:activity:123/"
+        assert scraper._finalize_linkedin_url(listing, "urn:li:compkey:x", [good]) == good
+
+    def test_finalize_linkedin_url_falls_back_to_activity_when_only_listing(self):
+        scraper = self._make_scraper()
+        listing = "https://www.linkedin.com/company/foo/posts/"
+        assert scraper._finalize_linkedin_url(
+            listing,
+            "urn:li:activity:999",
+            [listing],
+        ) == "https://www.linkedin.com/feed/update/urn:li:activity:999/"
+
+    def test_looks_like_linkedin_post_url(self):
+        scraper = self._make_scraper()
+        assert scraper._looks_like_linkedin_post_url(
+            "https://www.linkedin.com/feed/update/urn:li:activity:1/"
+        )
+        assert scraper._looks_like_linkedin_post_url(
+            "https://www.linkedin.com/posts/john_activity-123"
+        )
+        assert not scraper._looks_like_linkedin_post_url("https://example.com/x")
+
+    def test_normalize_clipboard_post_url(self):
+        scraper = self._make_scraper()
+        assert scraper._normalize_clipboard_post_url(
+            "https://www.linkedin.com/feed/update/urn:li:activity:1\n"
         ) == "https://www.linkedin.com/feed/update/urn:li:activity:1/"
 
     @pytest.mark.asyncio
