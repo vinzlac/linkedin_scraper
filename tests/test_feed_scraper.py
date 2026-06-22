@@ -108,6 +108,13 @@ class TestFeedScraperUnit:
                     "reactionsText": "42",
                     "commentsText": "7",
                     "repostsText": "3",
+                    "comments": [
+                        {
+                            "authorName": "Bob",
+                            "text": "Regarde ce lien utile",
+                            "url": "https://example.com/resource",
+                        }
+                    ],
                     "images": [],
                 }
             ]
@@ -126,6 +133,8 @@ class TestFeedScraperUnit:
         assert post.reposts_count == 3
         assert post.posted_date == "2h"
         assert post.linkedin_url == "https://www.linkedin.com/feed/update/urn:li:activity:123456/"
+        assert len(post.comments) == 1
+        assert post.comments[0]["url"] == "https://example.com/resource"
 
     @pytest.mark.asyncio
     async def test_extract_posts_compkey_urn_uses_permalink_from_dom(self):

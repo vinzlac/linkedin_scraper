@@ -12,6 +12,12 @@ logger = logging.getLogger(__name__)
 
 FEED_URL = "https://www.linkedin.com/feed/"
 
+# Texte du menu overflow « Copier le lien » (FR/EN) — LinkedIn peut rendre un button sans role=menuitem
+_COPY_LINK_MENU_TEXT_RE = re.compile(
+    r"Copier le lien vers le post|Copier le lien|Copy link to post|Copy link\b",
+    re.I,
+)
+
 # Wait for at least one Republier/Repost action button to appear (one per feed post)
 _WAIT_FOR_FEED_JS = (
     "() => Array.from(document.querySelectorAll('button'))"
@@ -67,11 +73,27 @@ class FeedScraper(BaseScraper):
         await self.callback.on_progress("Feed loaded", 20)
 
         posts = await self._scrape_posts(limit)
+        posts = await self._enrich_missing_comments_from_post_page(posts)
         await self.callback.on_progress(f"Scraped {len(posts)} posts", 100)
         await self.callback.on_complete("feed", posts)
 
         logger.info(f"Successfully scraped {len(posts)} posts from feed")
         return posts
+
+    async def scrape_post_by_url(self, post_url: str) -> List[Post]:
+        """Scrape un post LinkedIn précis depuis son URL /feed/update/."""
+        logger.info("Starting single post scraping: %s", post_url)
+        await self.callback.on_start("feed_single_post", post_url)
+        await self.navigate_and_wait(post_url)
+        await self.ensure_logged_in()
+        await self.check_rate_limit()
+        await self.page.wait_for_timeout(1200)
+        posts = await self._extract_posts_from_feed()
+        posts = await self._enrich_missing_comments_from_post_page(posts)
+        if not posts:
+            return []
+        # On une page de détail, le premier post extrait correspond normalement au post cible.
+        return [posts[0]]
 
     async def _scrape_posts(self, limit: int) -> List[Post]:
         posts: List[Post] = []
@@ -94,6 +116,7 @@ class FeedScraper(BaseScraper):
         return posts[:limit]
 
     async def _extract_posts_from_feed(self) -> List[Post]:
+        await self._expand_visible_comments_for_url_scrape()
         posts_data = await self.page.evaluate("""() => {
             var repostBtns = Array.from(document.querySelectorAll("button")).filter(function(b) {
                 var t = (b.innerText || "").trim();
@@ -678,6 +701,57 @@ class FeedScraper(BaseScraper):
                     externalUrl = full;
                 }
 
+                // ---- Comments containing URLs ----
+                // Best effort: LinkedIn does not always render comment DOM if collapsed.
+                var comments = [];
+                var seenCommentLinks = {};
+                function addCommentUrl(url, author, text) {
+                    if (!url) return;
+                    var dedupKey = (author || "") + "|" + url;
+                    if (seenCommentLinks[dedupKey]) return;
+                    seenCommentLinks[dedupKey] = true;
+                    comments.push({
+                        authorName: author || null,
+                        text: text || null,
+                        url: url
+                    });
+                }
+                var commentSelectors = [
+                    '.comments-comment-item',
+                    '[data-id^="urn:li:comment"]',
+                    '.comments-comment-item-content-body',
+                    '.comments-comment-item__main-content'
+                ];
+                var commentNodes = [];
+                for (var cs = 0; cs < commentSelectors.length; cs++) {
+                    var found = el.querySelectorAll(commentSelectors[cs]);
+                    for (var fi = 0; fi < found.length; fi++) commentNodes.push(found[fi]);
+                }
+                for (var ci = 0; ci < commentNodes.length; ci++) {
+                    var cnode = commentNodes[ci];
+                    var ctext = (cnode.innerText || "").trim().slice(0, 2000);
+                    var cauthor = "";
+                    var authorEl = cnode.querySelector('.comments-post-meta__name-text, .comments-post-meta__name, a[href*="/in/"]');
+                    if (authorEl) cauthor = (authorEl.innerText || "").trim().slice(0, 120);
+
+                    var cLinks = cnode.querySelectorAll("a[href]");
+                    for (var cli = 0; cli < cLinks.length; cli++) {
+                        var chref = cLinks[cli].getAttribute("href") || "";
+                        if (!chref || chref.startsWith("#") || chref.startsWith("javascript")) continue;
+                        var cfull = chref.startsWith("http") ? chref : "https://www.linkedin.com" + chref;
+                        if (!cfull.includes("http")) continue;
+                        addCommentUrl(cfull, cauthor, ctext);
+                    }
+                    // Fallback texte brut si LinkedIn n'expose pas d'ancre <a>.
+                    var urlMatches = ctext.match(/(?:https?:\\/\\/|www\\.)[^\\s<>"')]+/gi) || [];
+                    for (var um = 0; um < urlMatches.length; um++) {
+                        var rawUrl = urlMatches[um] || "";
+                        if (!rawUrl) continue;
+                        if (rawUrl.indexOf("http") !== 0) rawUrl = "https://" + rawUrl;
+                        addCommentUrl(rawUrl, cauthor, ctext);
+                    }
+                }
+
                 if (!permalinkUrl) {
                     permalinkUrl = extractPermalinkFromContainer(el);
                 }
@@ -697,6 +771,7 @@ class FeedScraper(BaseScraper):
                     content: content,
                     reactionsText: reactionsText,
                     commentsText: commentsText,
+                    comments: comments,
                     images: images,
                     videoUrl: videoUrl,
                     externalUrl: externalUrl,
@@ -718,6 +793,34 @@ class FeedScraper(BaseScraper):
             if external_url:
                 external_url = await self._resolve_url(external_url)
 
+            comments = data.get("comments", []) or []
+            normalized_comments: List[Dict[str, Any]] = []
+            for c in comments:
+                if not isinstance(c, dict):
+                    continue
+                raw_url = (c.get("url") or "").strip()
+                if not raw_url:
+                    continue
+                resolved_url = raw_url
+                if (
+                    "lnkd.in" in raw_url.lower()
+                    or "/slink" in raw_url.lower()
+                    or "linkedin.com/redir/" in raw_url.lower()
+                ):
+                    resolved_url = await self._resolve_url(raw_url)
+                kept_url = resolved_url if self._is_external_comment_url(resolved_url) else None
+                if not kept_url and "lnkd.in" in raw_url.lower() and self._is_external_comment_url(raw_url):
+                    kept_url = raw_url
+                if not kept_url:
+                    continue
+                normalized_comments.append(
+                    {
+                        "author_name": c.get("authorName") or None,
+                        "text": c.get("text") or None,
+                        "url": kept_url,
+                    }
+                )
+
             post = Post(
                 linkedin_url=linkedin_url,
                 urn=urn,
@@ -738,10 +841,142 @@ class FeedScraper(BaseScraper):
                 image_urls=data.get("images", []),
                 video_url=data.get("videoUrl") or None,
                 article_url=external_url,
+                comments=normalized_comments,
             )
             result.append(post)
 
         return result
+
+    async def _enrich_missing_comments_from_post_page(self, posts: List[Post]) -> List[Post]:
+        """For posts with comments_count but empty comments, open detail page and extract URLs."""
+        targets = [
+            p for p in posts
+            if (p.comments_count or 0) > 0 and not p.comments and p.linkedin_url
+        ]
+        if not targets:
+            return posts
+
+        logger.info("Comments URL fallback on detail pages: %s target(s)", len(targets))
+        original_url = self.page.url
+        for post in targets:
+            try:
+                await self.page.goto(post.linkedin_url, wait_until="domcontentloaded", timeout=25000)
+                await self.page.wait_for_timeout(900)
+                detail_comments = await self._extract_comment_urls_from_current_page()
+                if detail_comments:
+                    post.comments = detail_comments
+                    logger.info(
+                        "Comments URL fallback resolved for %s -> %s urls",
+                        post.urn,
+                        len(detail_comments),
+                    )
+            except Exception as e:
+                logger.debug("Comments URL fallback failed for %s: %s", post.urn, e)
+                continue
+        try:
+            if original_url:
+                await self.page.goto(original_url, wait_until="domcontentloaded", timeout=25000)
+        except Exception:
+            pass
+        return posts
+
+    async def _extract_comment_urls_from_current_page(self) -> List[Dict[str, Any]]:
+        """Extract comment URLs from currently opened post page."""
+        raw_comments = await self.page.evaluate(
+            """() => {
+                const out = [];
+                const seen = new Set();
+                const nodes = Array.from(document.querySelectorAll(
+                    '.comments-comment-item, [data-id^="urn:li:comment"], .comments-comment-item__main-content'
+                ));
+                function add(url, author, text) {
+                    if (!url) return;
+                    const key = `${author||""}|${url}`;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    out.push({ authorName: author || null, text: text || null, url });
+                }
+                for (const n of nodes) {
+                    const text = (n.innerText || "").trim().slice(0, 2500);
+                    const authorEl = n.querySelector('.comments-post-meta__name-text, .comments-post-meta__name, a[href*="/in/"]');
+                    const author = authorEl ? (authorEl.innerText || "").trim().slice(0, 120) : "";
+                    n.querySelectorAll("a[href]").forEach(a => {
+                        let href = a.getAttribute("href") || "";
+                        if (!href || href.startsWith("#") || href.startsWith("javascript")) return;
+                        if (!href.startsWith("http")) href = "https://www.linkedin.com" + href;
+                        add(href, author, text);
+                    });
+                    const textUrls = text.match(/(?:https?:\\/\\/|www\\.)[^\\s<>"')]+/gi) || [];
+                    textUrls.forEach(u => {
+                        let v = u;
+                        if (!v.startsWith("http")) v = "https://" + v;
+                        add(v, author, text);
+                    });
+                }
+                return out.slice(0, 120);
+            }"""
+        )
+
+        normalized: List[Dict[str, Any]] = []
+        for c in raw_comments or []:
+            if not isinstance(c, dict):
+                continue
+            url = (c.get("url") or "").strip()
+            if not url:
+                continue
+            resolved_url = url
+            if (
+                "lnkd.in" in url.lower()
+                or "/slink" in url.lower()
+                or "linkedin.com/redir/" in url.lower()
+            ):
+                resolved_url = await self._resolve_url(url)
+            kept_url = resolved_url if self._is_external_comment_url(resolved_url) else None
+            if not kept_url and "lnkd.in" in url.lower() and self._is_external_comment_url(url):
+                kept_url = url
+            if not kept_url:
+                continue
+            normalized.append(
+                {
+                    "author_name": c.get("authorName") or None,
+                    "text": c.get("text") or None,
+                    "url": kept_url,
+                }
+            )
+        return normalized
+
+    async def _expand_visible_comments_for_url_scrape(self) -> None:
+        """Best effort: open visible comment threads so comment links appear in DOM."""
+        try:
+            buttons = self.page.locator("button[aria-label]")
+            total = min(await buttons.count(), 80)
+            opened = 0
+            for i in range(total):
+                btn = buttons.nth(i)
+                try:
+                    if not await btn.is_visible():
+                        continue
+                    label = ((await btn.get_attribute("aria-label")) or "").strip().lower()
+                    if not label:
+                        continue
+                    if "comment" not in label and "commentaire" not in label:
+                        continue
+                    # Skip "Commenter/Comment" action button (composer), keep open-thread controls.
+                    if label in {"comment", "commenter"}:
+                        continue
+                    if "écrire un commentaire" in label or "write a comment" in label:
+                        continue
+                    await btn.click(timeout=1200)
+                    opened += 1
+                    if opened >= 8:
+                        break
+                    await self.page.wait_for_timeout(120)
+                except Exception:
+                    continue
+            if opened:
+                await self.page.wait_for_timeout(300)
+        except Exception:
+            pass
 
     async def _fill_missing_permalinks_from_ui(
         self,
@@ -867,6 +1102,11 @@ class FeedScraper(BaseScraper):
                     continue
 
             if menu_btn is None:
+                ah = (data.get("authorName") or data.get("actorName") or "?")[:48]
+                logger.warning(
+                    "permalink_fallback [%s]: menu_button_not_found (no overflow control in card)",
+                    ah,
+                )
                 data["uiPermalinkFallbackError"] = "; ".join(errors + ["menu_button_not_found"])
                 continue
 
@@ -928,16 +1168,20 @@ class FeedScraper(BaseScraper):
                     data["permalinkUrl"] = data.get("permalinkUrl") or menu_candidate[0]
                     data["uiPermalinkFallbackStatus"] = "resolved_via_ui_menu"
                 else:
-                    clip_url = await self._try_read_permalink_via_copy_link_menu()
+                    log_label = (data.get("authorName") or data.get("actorName") or "?")[:48]
+                    clip_url, clip_diag = await self._try_read_permalink_via_copy_link_menu(
+                        log_label=log_label
+                    )
                     if clip_url:
                         merged = (data.get("permalinkCandidates", []) or []) + [clip_url]
                         data["permalinkCandidates"] = list(dict.fromkeys(merged))
                         data["permalinkUrl"] = data.get("permalinkUrl") or clip_url
                         data["uiPermalinkFallbackStatus"] = "resolved_via_copy_link_clipboard"
                     else:
-                        data["uiPermalinkFallbackError"] = "; ".join(
-                            errors + ["menu_opened_but_no_permalink"]
-                        )
+                        err_parts = errors + ["menu_opened_but_no_permalink"]
+                        if clip_diag:
+                            err_parts.append(clip_diag)
+                        data["uiPermalinkFallbackError"] = "; ".join(err_parts)
             except Exception as e:
                 data["uiPermalinkFallbackError"] = "; ".join(errors + [f"menu_extract_failed:{e}"])
             finally:
@@ -957,14 +1201,45 @@ class FeedScraper(BaseScraper):
         return False
 
     @staticmethod
+    def _is_external_comment_url(url: str) -> bool:
+        """Keep only external URLs for comments, but allow lnkd.in short-links."""
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            if not host:
+                return False
+            if host == "lnkd.in" or host.endswith(".lnkd.in"):
+                return True
+            if host == "linkedin.com" or host.endswith(".linkedin.com"):
+                return False
+            # Common false positive from post text ("CLAUDE.md") auto-cast as URL.
+            if host in {"claude.md", "www.claude.md"}:
+                return False
+            # Basic hostname sanity (must contain a dot and a plausible TLD).
+            if "." not in host:
+                return False
+            tld = host.rsplit(".", 1)[-1]
+            if len(tld) < 2:
+                return False
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def _normalize_clipboard_post_url(url: str) -> str:
         u = url.strip().splitlines()[0].strip()
         if "/feed/update/" in u and not u.endswith("/"):
             u = f"{u}/"
         return u
 
-    async def _try_read_permalink_via_copy_link_menu(self) -> Optional[str]:
-        """Overflow déjà ouvert : clique « Copier le lien vers le post » et lit le presse-papiers."""
+    async def _try_read_permalink_via_copy_link_menu(self, log_label: str = "") -> tuple[Optional[str], str]:
+        """Overflow déjà ouvert : clique « Copier le lien vers le post » et lit le presse-papiers.
+
+        Returns:
+            (url normalisée ou None, code diagnostic vide si succès — utile logs + ui_permalink_fallback_error)
+        """
+        label = (log_label or "?").strip() or "?"
+
         try:
             for origin in ("https://www.linkedin.com", "https://linkedin.com"):
                 try:
@@ -974,33 +1249,76 @@ class FeedScraper(BaseScraper):
                     )
                 except Exception:
                     pass
-        except Exception:
-            pass
-
-        try:
-            items = (
-                self.page.locator('[role="menu"]:visible')
-                .last.locator('[role="menuitem"]')
-                .filter(
-                    has_text=re.compile(
-                        r"Copier le lien vers le post|Copier le lien|Copy link to post",
-                        re.I,
-                    )
-                )
-            )
-            if await items.count() == 0:
-                items = self.page.locator('[role="menuitem"]').filter(
-                    has_text=re.compile(
-                        r"Copier le lien vers le post|Copier le lien|Copy link to post",
-                        re.I,
-                    )
-                )
-            if await items.count() == 0:
-                return None
-            await items.last.click(timeout=5000)
         except Exception as e:
-            logger.debug("copy_link menuitem click failed: %s", e)
-            return None
+            logger.debug("permalink_fallback [%s]: grant_permissions skipped: %s", label, e)
+
+        async def _try_click(loc: Any, strategy: str) -> bool:
+            try:
+                n = await loc.count()
+                if n == 0:
+                    logger.debug(
+                        "permalink copy_link [%s] strategy=%s count=0",
+                        label,
+                        strategy,
+                    )
+                    return False
+                await loc.last.click(timeout=5000)
+                logger.info(
+                    "permalink copy_link [%s] clicked strategy=%s (n=%s)",
+                    label,
+                    strategy,
+                    n,
+                )
+                return True
+            except Exception as e:
+                logger.warning(
+                    "permalink copy_link [%s] strategy=%s click failed: %s",
+                    label,
+                    strategy,
+                    e,
+                )
+                return False
+
+        clicked = False
+        rx = _COPY_LINK_MENU_TEXT_RE
+
+        mv = self.page.locator('[role="menu"]:visible')
+        if await mv.count() > 0:
+            menu_last = mv.last
+            for loc, strategy in (
+                (menu_last.locator('[role="menuitem"]').filter(has_text=rx), "menuitem"),
+                (menu_last.locator("button").filter(has_text=rx), "button_in_menu"),
+                (
+                    menu_last.locator(
+                        "div.artdeco-dropdown__item, .artdeco-dropdown__item"
+                    ).filter(has_text=rx),
+                    "artdeco_item_in_menu",
+                ),
+            ):
+                if await _try_click(loc, strategy):
+                    clicked = True
+                    break
+
+        if not clicked:
+            dd = self.page.locator(".artdeco-dropdown__content--is-open")
+            if await dd.count() > 0:
+                loc = dd.last.locator(
+                    "button, [role='menuitem'], .artdeco-dropdown__item, div[role='button']"
+                ).filter(has_text=rx)
+                clicked = await _try_click(loc, "artdeco_dropdown_open")
+
+        if not clicked:
+            loc = self.page.locator('[role="menuitem"]').filter(has_text=rx)
+            clicked = await _try_click(loc, "menuitem_page_fallback")
+
+        if not clicked:
+            msg = "copy_link_no_matching_control"
+            logger.warning(
+                "permalink_fallback [%s]: %s (menu ouvert mais aucun bouton « Copier le lien » cliquable)",
+                label,
+                msg,
+            )
+            return None, msg
 
         await self.page.wait_for_timeout(450)
 
@@ -1015,18 +1333,51 @@ class FeedScraper(BaseScraper):
                 }"""
             )
         except Exception as e:
-            logger.debug("clipboard readText failed: %s", e)
-            return None
+            msg = f"clipboard_read_failed:{e}"
+            logger.warning("permalink_fallback [%s]: %s", label, msg)
+            return None, msg
 
-        if not text or not isinstance(text, str):
-            return None
+        if not text or not isinstance(text, str) or not text.strip():
+            msg = "clipboard_empty_after_copy"
+            logger.warning("permalink_fallback [%s]: %s", label, msg)
+            return None, msg
 
         url = text.strip().splitlines()[0].strip()
+
+        if "lnkd.in" in url.lower() or "/slink" in url.lower():
+            try:
+                resolved = await self._resolve_url(url)
+                if resolved and resolved != url:
+                    logger.info(
+                        "permalink_fallback [%s]: resolved short link -> %s",
+                        label,
+                        resolved[:100],
+                    )
+                    url = resolved
+            except Exception as e:
+                logger.debug("permalink_fallback [%s]: short link resolve skip: %s", label, e)
+
         if not FeedScraper._looks_like_linkedin_post_url(url):
-            return None
+            try:
+                url2 = await self._resolve_url(url)
+                if url2 and url2 != url and FeedScraper._looks_like_linkedin_post_url(url2):
+                    url = url2
+            except Exception:
+                pass
+
+        if not FeedScraper._looks_like_linkedin_post_url(url):
+            msg = f"clipboard_not_a_post_url:{url[:160]}"
+            logger.warning("permalink_fallback [%s]: %s", label, msg)
+            return None, msg
+
         if FeedScraper._is_company_posts_feed_listing(url):
-            return None
-        return FeedScraper._normalize_clipboard_post_url(url)
+            msg = f"clipboard_company_posts_listing:{url[:120]}"
+            logger.warning("permalink_fallback [%s]: %s", label, msg)
+            return None, msg
+
+        out = FeedScraper._normalize_clipboard_post_url(url)
+        logger.info("permalink_fallback [%s]: copy_link_clipboard ok url=%s", label, out[:90])
+        return out, ""
 
     @staticmethod
     def _is_company_posts_feed_listing(url: str) -> bool:
