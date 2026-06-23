@@ -81,7 +81,7 @@ class FeedScraper(BaseScraper):
         return posts
 
     async def scrape_post_by_url(self, post_url: str) -> List[Post]:
-        """Scrape un post LinkedIn précis depuis son URL /feed/update/."""
+        """Scrape un post LinkedIn précis depuis son URL /feed/update/ ou /posts/."""
         logger.info("Starting single post scraping: %s", post_url)
         await self.callback.on_start("feed_single_post", post_url)
         await self.navigate_and_wait(post_url)
@@ -91,9 +91,182 @@ class FeedScraper(BaseScraper):
         posts = await self._extract_posts_from_feed()
         posts = await self._enrich_missing_comments_from_post_page(posts)
         if not posts:
+            logger.warning("No post extracted from detail URL: %s", post_url)
             return []
-        # On une page de détail, le premier post extrait correspond normalement au post cible.
-        return [posts[0]]
+
+        post = posts[0]
+        await self._correct_author_on_detail_page(post, post_url)
+        return [post]
+
+    async def _correct_author_on_detail_page(self, post: Post, post_url: str) -> None:
+        """Sur page détail, l'auteur peut être confondu avec le compte de session (navbar)."""
+        if not self._is_post_detail_url(post_url):
+            return
+
+        card_author = await self._extract_author_from_post_card()
+        session_user = await self._get_session_user_profile()
+
+        if card_author.get("name") and card_author.get("url"):
+            if (
+                post.author_name != card_author["name"]
+                or post.author_url != card_author["url"]
+            ):
+                logger.warning(
+                    "Author corrected on detail page (%s): %r -> %r",
+                    card_author.get("source", "post_card"),
+                    post.author_name,
+                    card_author["name"],
+                )
+            post.author_name = card_author["name"]
+            post.author_url = card_author["url"]
+            return
+
+        if session_user.get("name") and post.author_name == session_user["name"]:
+            logger.warning(
+                "Author on detail page matches logged-in session user %r; "
+                "could not resolve post author from actor block (url=%s)",
+                post.author_name,
+                post_url,
+            )
+            post.author_name = None
+            post.author_url = None
+        elif not post.author_name:
+            logger.warning(
+                "Could not extract author on detail page (url=%s)",
+                post_url,
+            )
+
+    @staticmethod
+    def _is_post_detail_url(url: str) -> bool:
+        path = urlparse(url).path.lower()
+        return "/posts/" in path or "/feed/update/" in path
+
+    async def _get_session_user_profile(self) -> Dict[str, Optional[str]]:
+        """Profil affiché dans la barre de navigation (utilisateur connecté)."""
+        data = await self.page.evaluate("""() => {
+            function profileFromNavLink(a) {
+                if (!a) return null;
+                var href = a.getAttribute("href") || "";
+                var m = href.match(/[/]in[/][^/?#]+/);
+                if (!m) return null;
+                var nameSpan = a.querySelector("span[aria-hidden='true']");
+                var name = nameSpan
+                    ? (nameSpan.innerText || "").trim()
+                    : (a.innerText || "").trim().split("\\n")[0].trim();
+                if (!name || name.length < 2) return null;
+                return { name: name, url: "https://www.linkedin.com" + m[0] };
+            }
+            var nav = document.querySelector("#global-nav, header.global-nav");
+            if (!nav) return { name: null, url: null };
+            var meLink = nav.querySelector(
+                'a[href*="/in/"][data-view-name="identity-profile-photo"], ' +
+                'a[href*="/in/"].global-nav__me-photo, ' +
+                'a[href*="/in/"]'
+            );
+            var prof = profileFromNavLink(meLink);
+            return prof || { name: null, url: null };
+        }""")
+        if not isinstance(data, dict):
+            return {"name": None, "url": None}
+        return {
+            "name": data.get("name") or None,
+            "url": data.get("url") or None,
+        }
+
+    async def _extract_author_from_post_card(self) -> Dict[str, Optional[str]]:
+        """Extrait auteur depuis le bloc acteur du post (hors chrome global)."""
+        data = await self.page.evaluate("""() => {
+            function isGlobalChrome(node) {
+                if (!node) return false;
+                return !!node.closest(
+                    '#global-nav, header.global-nav, nav, ' +
+                    '[data-view-name="navigation"], .scaffold-layout-toolbar, ' +
+                    '.msg-overlay-list-bubble, .msg-overlay-bubble-header, ' +
+                    '.profile-rail-card, .scaffold-layout__aside--right, ' +
+                    '.comments-comment-item, .comments-comments-list'
+                );
+            }
+            function profileFromAnchor(a) {
+                if (!a || isGlobalChrome(a)) return null;
+                var href = a.getAttribute("href") || "";
+                var m = href.match(/[/]in[/][^/?#]+/) || href.match(/[/]company[/][^/?#]+/);
+                if (!m) return null;
+                var nameSpan = a.querySelector("span[aria-hidden='true']");
+                var rawText = nameSpan
+                    ? (nameSpan.innerText || "").trim()
+                    : (a.innerText || "").trim();
+                var candidate = rawText.split("\\n")[0].trim()
+                    .replace(/\\s*[^\\w\\s]\\s*(\\d+e(\\s+et\\s+\\+)?|Suivi|Following)[\\s\\S]*$/, "")
+                    .trim();
+                if (candidate.length < 2) return null;
+                return {
+                    name: candidate,
+                    url: "https://www.linkedin.com" + m[0],
+                };
+            }
+            function extractFromActor(actor, source) {
+                if (!actor || isGlobalChrome(actor)) return null;
+                var links = actor.querySelectorAll("a[href*='/in/'], a[href*='/company/']");
+                for (var i = 0; i < links.length; i++) {
+                    var prof = profileFromAnchor(links[i]);
+                    if (prof) return { name: prof.name, url: prof.url, source: source };
+                }
+                var nameEl = actor.querySelector(
+                    '.feed-shared-actor__name, .update-components-actor__name, ' +
+                    '.feed-shared-actor__title, .update-components-actor__title, ' +
+                    '.feed-shared-actor__meta-link, .update-components-actor__meta-link'
+                );
+                if (nameEl) {
+                    var nm = (nameEl.innerText || "").trim().split("\\n")[0].trim();
+                    if (nm.length >= 2) {
+                        var linkInActor = actor.querySelector("a[href*='/in/'], a[href*='/company/']");
+                        var url = null;
+                        if (linkInActor) {
+                            var hm = (linkInActor.getAttribute("href") || "")
+                                .match(/[/](in|company)[/][^/?#]+/);
+                            if (hm) url = "https://www.linkedin.com" + hm[0];
+                        }
+                        return { name: nm, url: url, source: source + "_text" };
+                    }
+                }
+                return null;
+            }
+
+            var postRoots = document.querySelectorAll(
+                '.feed-shared-update-v2, .feed-shared-update, ' +
+                'div[data-urn*="urn:li:activity"], div[data-urn*="urn:li:ugcPost"]'
+            );
+            for (var pr = 0; pr < postRoots.length; pr++) {
+                var root = postRoots[pr];
+                if (isGlobalChrome(root)) continue;
+                var actors = root.querySelectorAll(
+                    '.feed-shared-actor, .update-components-actor, ' +
+                    '[class*="feed-shared-actor__container"], [class*="update-components-actor__container"]'
+                );
+                for (var ai = 0; ai < actors.length; ai++) {
+                    var hit = extractFromActor(actors[ai], "post_card_actor");
+                    if (hit) return hit;
+                }
+            }
+
+            var pageActors = document.querySelectorAll(
+                '.feed-shared-actor, .update-components-actor, ' +
+                '[class*="feed-shared-actor__container"], [class*="update-components-actor__container"]'
+            );
+            for (var pa = 0; pa < pageActors.length; pa++) {
+                var hit2 = extractFromActor(pageActors[pa], "page_actor_fallback");
+                if (hit2) return hit2;
+            }
+
+            return { name: null, url: null, source: "none" };
+        }""")
+        if not isinstance(data, dict):
+            return {"name": None, "url": None, "source": "none"}
+        return {
+            "name": data.get("name") or None,
+            "url": data.get("url") or None,
+            "source": data.get("source") or "none",
+        }
 
     async def _scrape_posts(self, limit: int) -> List[Post]:
         posts: List[Post] = []
@@ -132,6 +305,94 @@ class FeedScraper(BaseScraper):
             function isTimeLine(line) { return line.length < 55 && timeRe.test(line); }
             // isDegree: short line like "• 2e" or "• 3e et +" (degree indicator in reshared headers)
             function isDegree(line) { return line.length < 16 && /\\d+e(\\s+et\\s+\\+)?$/.test(line); }
+
+            function isGlobalChrome(node) {
+                if (!node) return false;
+                return !!node.closest(
+                    '#global-nav, header.global-nav, nav, ' +
+                    '[data-view-name="navigation"], .scaffold-layout-toolbar, ' +
+                    '.msg-overlay-list-bubble, .msg-overlay-bubble-header, ' +
+                    '.profile-rail-card, .scaffold-layout__aside--right, ' +
+                    '.comments-comment-item, .comments-comments-list'
+                );
+            }
+            function profileLinkFromAnchor(a, actionTakerName) {
+                if (!a || isGlobalChrome(a)) return null;
+                var href = a.getAttribute("href") || "";
+                var m = href.match(/[/]in[/][^/?#]+/) || href.match(/[/]company[/][^/?#]+/);
+                if (!m) return null;
+                var nameSpan = a.querySelector("span[aria-hidden='true']");
+                var rawText = nameSpan
+                    ? (nameSpan.innerText || "").trim()
+                    : (a.innerText || "").trim();
+                var candidate = rawText.split("\\n")[0].trim()
+                    .replace(/\\s*[^\\w\\s]\\s*(\\d+e(\\s+et\\s+\\+)?|Suivi|Following)[\\s\\S]*$/, "")
+                    .trim();
+                if (candidate.length < 2) return null;
+                if (actionTakerName && candidate.toLowerCase() === actionTakerName) return null;
+                return {
+                    name: candidate,
+                    url: "https://www.linkedin.com" + m[0],
+                };
+            }
+            function extractAuthorFromContainer(el, actionTakerName) {
+                var authorName = "";
+                var authorUrl = "";
+                var actorRoots = el.querySelectorAll(
+                    '.feed-shared-actor, .update-components-actor, ' +
+                    '[class*="feed-shared-actor__container"], [class*="update-components-actor__container"]'
+                );
+                for (var ar = 0; ar < actorRoots.length && !authorName; ar++) {
+                    var actor = actorRoots[ar];
+                    if (isGlobalChrome(actor)) continue;
+                    var actorLinks = actor.querySelectorAll("a[href*='/in/'], a[href*='/company/']");
+                    for (var li = 0; li < actorLinks.length && !authorName; li++) {
+                        var prof = profileLinkFromAnchor(actorLinks[li], actionTakerName);
+                        if (!prof) continue;
+                        authorName = prof.name;
+                        authorUrl = prof.url;
+                    }
+                    if (!authorName) {
+                        var nameEl = actor.querySelector(
+                            '.feed-shared-actor__name, .update-components-actor__name, ' +
+                            '.feed-shared-actor__title, .update-components-actor__title, ' +
+                            '.feed-shared-actor__meta-link, .update-components-actor__meta-link'
+                        );
+                        if (nameEl) {
+                            var nm = (nameEl.innerText || "").trim().split("\\n")[0].trim();
+                            if (nm.length >= 2 && !(actionTakerName && nm.toLowerCase() === actionTakerName)) {
+                                authorName = nm;
+                                var linkInActor = actor.querySelector("a[href*='/in/'], a[href*='/company/']");
+                                if (linkInActor) {
+                                    var hm = (linkInActor.getAttribute("href") || "")
+                                        .match(/[/](in|company)[/][^/?#]+/);
+                                    if (hm) authorUrl = "https://www.linkedin.com" + hm[0];
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!authorName) {
+                    var inLinks = el.querySelectorAll("a[href*='/in/'], a[href*='/company/']");
+                    for (var i = 0; i < inLinks.length && !authorName; i++) {
+                        var prof2 = profileLinkFromAnchor(inLinks[i], actionTakerName);
+                        if (!prof2) continue;
+                        authorName = prof2.name;
+                        authorUrl = prof2.url;
+                    }
+                }
+                if (!authorName) {
+                    var allLines = (el.innerText || "").split("\\n").map(function(l) {
+                        return l.trim();
+                    }).filter(Boolean);
+                    var fallback = actionTakerName ? (allLines[2] || "") : (allLines[1] || "");
+                    fallback = fallback.replace(/\\s*(a\\s+|aime|comment|publi|r\u00e9agi).*$/i, "").trim();
+                    if (fallback.length > 1 && !isTimeLine(fallback) && !isDegree(fallback)) {
+                        authorName = fallback;
+                    }
+                }
+                return { name: authorName, url: authorUrl };
+            }
 
             function normalizeLinkedInHref(href) {
                 if (!href) return "";
@@ -479,43 +740,9 @@ class FeedScraper(BaseScraper):
                 }
 
                 // ---- Author (original content creator) ----
-                var authorName = "";
-                var authorUrl = "";
-                var inLinks = el.querySelectorAll("a[href*='/in/']");
-                for (var i = 0; i < inLinks.length && !authorName; i++) {
-                    var href = inLinks[i].getAttribute("href") || "";
-                    var m = href.match(/[/]in[/][^/?#]+/);
-                    if (!m) continue;
-                    var nameSpan = inLinks[i].querySelector("span[aria-hidden='true']");
-                    var rawText = nameSpan ? (nameSpan.innerText || "").trim() : (inLinks[i].innerText || "").trim();
-                    var candidate = rawText.split("\\n")[0].trim()
-                        .replace(/\\s*[^\\w\\s]\\s*(\\d+e(\\s+et\\s+\\+)?|Suivi|Following)[\\s\\S]*$/, "").trim();
-                    if (candidate.length < 2) continue;
-                    if (actionTakerName && candidate.toLowerCase() === actionTakerName) continue;
-                    authorUrl = "https://www.linkedin.com" + m[0];
-                    authorName = candidate;
-                }
-                if (!authorName) {
-                    var compLinks = el.querySelectorAll("a[href*='/company/']");
-                    for (var i = 0; i < compLinks.length && !authorName; i++) {
-                        var href = compLinks[i].getAttribute("href") || "";
-                        var m = href.match(/[/]company[/][^/?#]+/);
-                        if (!m) continue;
-                        var nameSpan = compLinks[i].querySelector("span[aria-hidden='true']");
-                        var rawText = nameSpan ? (nameSpan.innerText || "").trim() : (compLinks[i].innerText || "").trim();
-                        var candidate = rawText.split("\\n")[0].trim();
-                        if (candidate.length < 2) continue;
-                        authorUrl = "https://www.linkedin.com" + m[0];
-                        authorName = candidate;
-                    }
-                }
-                if (!authorName) {
-                    var fallback = actionTakerName ? (allLines[2] || "") : (allLines[1] || "");
-                    fallback = fallback.replace(/\\s*(a\\s+|aime|comment|publi|r\u00e9agi).*$/i, "").trim();
-                    if (fallback.length > 1 && !isTimeLine(fallback) && !isDegree(fallback)) {
-                        authorName = fallback;
-                    }
-                }
+                var authorInfo = extractAuthorFromContainer(el, actionTakerName);
+                var authorName = authorInfo.name;
+                var authorUrl = authorInfo.url;
 
                 // ---- Published date ----
                 var publishedAt = "";

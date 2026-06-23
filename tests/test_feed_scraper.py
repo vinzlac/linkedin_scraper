@@ -78,6 +78,84 @@ class TestFeedScraperUnit:
         )
         assert not scraper._looks_like_linkedin_post_url("https://example.com/x")
 
+    def test_is_post_detail_url(self):
+        scraper = self._make_scraper()
+        assert scraper._is_post_detail_url(
+            "https://www.linkedin.com/posts/nmartignole_test-share-123/"
+        )
+        assert scraper._is_post_detail_url(
+            "https://www.linkedin.com/feed/update/urn:li:activity:1/"
+        )
+        assert not scraper._is_post_detail_url("https://www.linkedin.com/feed/")
+
+    @pytest.mark.asyncio
+    async def test_correct_author_on_detail_page_replaces_wrong_author(self):
+        scraper = self._make_scraper()
+        post = Post(
+            author_name="Vincent Lacoste",
+            author_url="https://www.linkedin.com/in/vincent-lacoste",
+            text="Post de test",
+        )
+        with patch.object(
+            scraper,
+            "_extract_author_from_post_card",
+            new=AsyncMock(
+                return_value={
+                    "name": "Nicolas Martignole",
+                    "url": "https://www.linkedin.com/in/nmartignole",
+                    "source": "post_card_actor",
+                }
+            ),
+        ):
+            with patch.object(
+                scraper,
+                "_get_session_user_profile",
+                new=AsyncMock(
+                    return_value={
+                        "name": "Vincent Lacoste",
+                        "url": "https://www.linkedin.com/in/vincent-lacoste",
+                    }
+                ),
+            ):
+                await scraper._correct_author_on_detail_page(
+                    post,
+                    "https://www.linkedin.com/posts/nmartignole_test-share-123/",
+                )
+
+        assert post.author_name == "Nicolas Martignole"
+        assert post.author_url == "https://www.linkedin.com/in/nmartignole"
+
+    @pytest.mark.asyncio
+    async def test_correct_author_on_detail_page_clears_session_user_fallback(self):
+        scraper = self._make_scraper()
+        post = Post(
+            author_name="Vincent Lacoste",
+            author_url="https://www.linkedin.com/in/vincent-lacoste",
+            text="Post de test",
+        )
+        with patch.object(
+            scraper,
+            "_extract_author_from_post_card",
+            new=AsyncMock(return_value={"name": None, "url": None, "source": "none"}),
+        ):
+            with patch.object(
+                scraper,
+                "_get_session_user_profile",
+                new=AsyncMock(
+                    return_value={
+                        "name": "Vincent Lacoste",
+                        "url": "https://www.linkedin.com/in/vincent-lacoste",
+                    }
+                ),
+            ):
+                await scraper._correct_author_on_detail_page(
+                    post,
+                    "https://www.linkedin.com/posts/unknown-share-123/",
+                )
+
+        assert post.author_name is None
+        assert post.author_url is None
+
     def test_normalize_clipboard_post_url(self):
         scraper = self._make_scraper()
         assert scraper._normalize_clipboard_post_url(
@@ -259,7 +337,24 @@ class TestFeedScraperIntegration:
     @pytest.mark.integration
     @pytest.mark.slow
     @pytest.mark.asyncio
-    async def test_scrape_respects_limit(self, browser_with_session):
+    async def test_scrape_post_by_url_author_not_session_user(self, browser_with_session):
+        post_url = (
+            "https://www.linkedin.com/posts/nmartignole_je-rentre-de-2-jours-de-conf"
+            "%C3%A9rences-passionnants-share-7474414301475213312-8xjU/"
+        )
         scraper = FeedScraper(browser_with_session.page)
-        posts = await scraper.scrape(limit=3)
-        assert len(posts) <= 3
+        session_user = await scraper._get_session_user_profile()
+        posts = await scraper.scrape_post_by_url(post_url)
+
+        assert len(posts) == 1
+        post = posts[0]
+        assert post.text and "voxxed" in post.text.lower()
+
+        author = (post.author_name or "").lower()
+        session_name = (session_user.get("name") or "").lower()
+        if session_name:
+            assert post.author_name != session_user["name"], (
+                "author_name must not be the logged-in session user on a third-party post"
+            )
+        assert "martignole" in author or "nicolas" in author
+
