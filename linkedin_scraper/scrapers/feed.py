@@ -18,10 +18,15 @@ _COPY_LINK_MENU_TEXT_RE = re.compile(
     re.I,
 )
 
-# Wait for at least one Republier/Repost action button to appear (one per feed post)
+# Wait for at least one Republier/Repost action button (text or aria-label; LinkedIn icon-only UI)
 _WAIT_FOR_FEED_JS = (
     "() => Array.from(document.querySelectorAll('button'))"
-    ".some(function(b){var t=(b.innerText||'').trim();return t==='Republier'||t==='Repost';})"
+    ".some(function(b){"
+    "var t=(b.innerText||'').trim();"
+    "if(t==='Republier'||t==='Repost')return true;"
+    "var a=(b.getAttribute('aria-label')||'').trim();"
+    "return /^Republier\\b/i.test(a)||/^Repost\\b/i.test(a);"
+    "})"
 )
 
 
@@ -291,10 +296,14 @@ class FeedScraper(BaseScraper):
     async def _extract_posts_from_feed(self) -> List[Post]:
         await self._expand_visible_comments_for_url_scrape()
         posts_data = await self.page.evaluate("""() => {
-            var repostBtns = Array.from(document.querySelectorAll("button")).filter(function(b) {
+            function isRepostButton(b) {
+                if (!b) return false;
                 var t = (b.innerText || "").trim();
-                return t === "Republier" || t === "Repost";
-            });
+                if (t === "Republier" || t === "Repost") return true;
+                var aria = (b.getAttribute("aria-label") || "").trim();
+                return /^Republier\\b/i.test(aria) || /^Repost\\b/i.test(aria);
+            }
+            var repostBtns = Array.from(document.querySelectorAll("button")).filter(isRepostButton);
 
             var results = [];
             var seenUrns = {};
@@ -594,10 +603,7 @@ class FeedScraper(BaseScraper):
                 while (el && el !== document.body) {
                     var parent = el.parentElement;
                     if (!parent || parent === document.body) break;
-                    var parentCount = Array.from(parent.querySelectorAll("button")).filter(function(b) {
-                        var t = (b.innerText || "").trim();
-                        return t === "Republier" || t === "Repost";
-                    }).length;
+                    var parentCount = Array.from(parent.querySelectorAll("button")).filter(isRepostButton).length;
                     if (parentCount > 1) break;
                     el = el.parentElement;
                 }

@@ -29,6 +29,14 @@ Le guide [integration-linkedin-mcp.md](integration-linkedin-mcp.md) est un guide
 
 → [Guide d'intégration linkedin-mcp](integration-linkedin-mcp.md)
 
+## Post-mortems
+
+Incidents de scraping documentés (régressions DOM, session, MCP) :
+
+| Date | Incident | Fichier |
+|------|----------|---------|
+| 2026-06-25 | Feed vide — boutons Republier icône (`aria-label` only) | [post-mortem/2026-06-25-feed-repost-aria-label.md](post-mortem/2026-06-25-feed-repost-aria-label.md) |
+
 ## Ressources
 
 - [README principal](../README.md) — installation, quick start, API
