@@ -21,24 +21,33 @@ class BrowserManager:
         slow_mo: int = 0,
         viewport: Optional[Dict[str, int]] = None,
         user_agent: Optional[str] = None,
+        cdp_url: Optional[str] = None,
         **launch_options: Any
     ):
         """
         Initialize browser manager.
-        
+
         Args:
-            headless: Run browser in headless mode
-            slow_mo: Slow down operations by specified milliseconds
+            headless: Run browser in headless mode (ignored when cdp_url is set —
+                the remote browser's own launch flags decide that)
+            slow_mo: Slow down operations by specified milliseconds (ignored when
+                cdp_url is set)
             viewport: Browser viewport size (default: 1280x720)
             user_agent: Custom user agent string
-            **launch_options: Additional Playwright launch options
+            cdp_url: Connect to an existing Chromium over the DevTools Protocol
+                (e.g. "http://192.168.1.153:9222") instead of launching a new
+                local browser. See ADR-017: the browser then runs on a remote
+                host and no window ever appears locally, regardless of headless.
+            **launch_options: Additional Playwright launch options (ignored when
+                cdp_url is set)
         """
         self.headless = headless
         self.slow_mo = slow_mo
         self.viewport = viewport or {"width": 1280, "height": 720}
         self.user_agent = user_agent
+        self.cdp_url = cdp_url
         self.launch_options = launch_options
-        
+
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
@@ -55,19 +64,24 @@ class BrowserManager:
         await self.close()
     
     async def start(self) -> None:
-        """Start Playwright and launch browser."""
+        """Start Playwright and either connect to an existing browser (CDP) or
+        launch a new local one."""
         try:
             self._playwright = await async_playwright().start()
-            
-            # Launch browser
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless,
-                slow_mo=self.slow_mo,
-                **self.launch_options
-            )
-            
-            logger.info(f"Browser launched (headless={self.headless})")
-            
+
+            if self.cdp_url:
+                self._browser = await self._playwright.chromium.connect_over_cdp(
+                    self.cdp_url
+                )
+                logger.info(f"Connected to existing browser via CDP: {self.cdp_url}")
+            else:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self.headless,
+                    slow_mo=self.slow_mo,
+                    **self.launch_options
+                )
+                logger.info(f"Browser launched (headless={self.headless})")
+
             # Create context
             context_options: Dict[str, Any] = {
                 "viewport": self.viewport,
@@ -99,14 +113,21 @@ class BrowserManager:
                 self._context = None
             
             if self._browser:
+                # For a CDP connection, Playwright's Browser.close() disconnects
+                # the client rather than killing the remote browser process —
+                # safe to call unconditionally, it never terminates a shared
+                # Chromium (e.g. the openclaw chromium-cdp-host/pod) that other
+                # clients may still be using.
                 await self._browser.close()
                 self._browser = None
-            
+
             if self._playwright:
                 await self._playwright.stop()
                 self._playwright = None
-            
-            logger.info("Browser closed")
+
+            logger.info(
+                "Browser disconnected (CDP)" if self.cdp_url else "Browser closed"
+            )
             
         except Exception as e:
             logger.error(f"Error closing browser: {e}")

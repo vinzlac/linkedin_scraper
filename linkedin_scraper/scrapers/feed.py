@@ -6,9 +6,19 @@ from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from ..models.post import Post
 from ..callbacks import ProgressCallback, SilentCallback
+from ..core import get_cached_permalink, save_cached_permalink
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
+
+# Hard cap on how many cards' overflow menus a single _fill_missing_permalinks_from_ui
+# call will open. Each miss costs several clicks + clipboard reads against a live
+# LinkedIn session; without a cap, a scroll batch with many uncached cards could
+# fire dozens of rapid UI interactions in one call — the interaction pattern that
+# triggered the 2026-07-22 rate limit. Cards beyond the cap keep whatever
+# _finalize_linkedin_url can derive without UI interaction and get resolved on a
+# later call once the cache is warm.
+_MAX_UI_FALLBACK_PER_CALL = 4
 
 FEED_URL = "https://www.linkedin.com/feed/"
 
@@ -1219,11 +1229,34 @@ class FeedScraper(BaseScraper):
 
         This is a best-effort fallback for feed cards exposing only `compkey` in DOM.
         It must never fail scraping: errors are returned in per-post attributes.
+
+        Two rate-limit safeguards on top of the fallback itself:
+        - a disk cache (urn -> permalink) skips the UI entirely for cards
+          already resolved in a previous call/process;
+        - a hard cap on how many cards can go through the UI fallback in a
+          single call, so a cold cache with many missing permalinks can't
+          fire dozens of overflow-menu clicks back to back.
         """
+        ui_fallback_attempts = 0
         for data in posts_data:
             if data.get("permalinkUrl"):
                 data["uiPermalinkFallbackStatus"] = "not_needed"
                 continue
+
+            urn = data.get("urn") or ""
+            cached = get_cached_permalink(urn)
+            if cached:
+                data["permalinkUrl"] = cached
+                data["permalinkCandidates"] = list(
+                    dict.fromkeys((data.get("permalinkCandidates", []) or []) + [cached])
+                )
+                data["uiPermalinkFallbackStatus"] = "resolved_via_cache"
+                continue
+
+            if ui_fallback_attempts >= _MAX_UI_FALLBACK_PER_CALL:
+                data["uiPermalinkFallbackStatus"] = "skipped_cap_reached"
+                continue
+            ui_fallback_attempts += 1
 
             data["uiPermalinkFallbackStatus"] = "no_permalink_found"
             errors: List[str] = []
@@ -1310,6 +1343,7 @@ class FeedScraper(BaseScraper):
                 )
                 data["permalinkUrl"] = data["permalinkUrl"] or card_dom_candidates[0]
                 data["uiPermalinkFallbackStatus"] = "resolved_via_card_dom"
+                save_cached_permalink(urn, data["permalinkUrl"])
                 try:
                     await self.page.keyboard.press("Escape")
                 except Exception:
@@ -1400,6 +1434,7 @@ class FeedScraper(BaseScraper):
                     )
                     data["permalinkUrl"] = data.get("permalinkUrl") or menu_candidate[0]
                     data["uiPermalinkFallbackStatus"] = "resolved_via_ui_menu"
+                    save_cached_permalink(urn, data["permalinkUrl"])
                 else:
                     log_label = (data.get("authorName") or data.get("actorName") or "?")[:48]
                     clip_url, clip_diag = await self._try_read_permalink_via_copy_link_menu(
@@ -1410,6 +1445,7 @@ class FeedScraper(BaseScraper):
                         data["permalinkCandidates"] = list(dict.fromkeys(merged))
                         data["permalinkUrl"] = data.get("permalinkUrl") or clip_url
                         data["uiPermalinkFallbackStatus"] = "resolved_via_copy_link_clipboard"
+                        save_cached_permalink(urn, data["permalinkUrl"])
                     else:
                         err_parts = errors + ["menu_opened_but_no_permalink"]
                         if clip_diag:
@@ -1515,34 +1551,45 @@ class FeedScraper(BaseScraper):
         clicked = False
         rx = _COPY_LINK_MENU_TEXT_RE
 
-        mv = self.page.locator('[role="menu"]:visible')
-        if await mv.count() > 0:
-            menu_last = mv.last
-            for loc, strategy in (
-                (menu_last.locator('[role="menuitem"]').filter(has_text=rx), "menuitem"),
-                (menu_last.locator("button").filter(has_text=rx), "button_in_menu"),
-                (
-                    menu_last.locator(
-                        "div.artdeco-dropdown__item, .artdeco-dropdown__item"
-                    ).filter(has_text=rx),
-                    "artdeco_item_in_menu",
-                ),
-            ):
-                if await _try_click(loc, strategy):
-                    clicked = True
-                    break
+        # The overflow menu can render its items asynchronously right after
+        # the "..." click, so a single immediate attempt can race the DOM and
+        # miss "Copier le lien" even though it appears a few hundred ms later.
+        # Retry the whole strategy cascade a few times before giving up.
+        for retry in range(3):
+            if retry:
+                await self.page.wait_for_timeout(400)
 
-        if not clicked:
-            dd = self.page.locator(".artdeco-dropdown__content--is-open")
-            if await dd.count() > 0:
-                loc = dd.last.locator(
-                    "button, [role='menuitem'], .artdeco-dropdown__item, div[role='button']"
-                ).filter(has_text=rx)
-                clicked = await _try_click(loc, "artdeco_dropdown_open")
+            mv = self.page.locator('[role="menu"]:visible')
+            if await mv.count() > 0:
+                menu_last = mv.last
+                for loc, strategy in (
+                    (menu_last.locator('[role="menuitem"]').filter(has_text=rx), "menuitem"),
+                    (menu_last.locator("button").filter(has_text=rx), "button_in_menu"),
+                    (
+                        menu_last.locator(
+                            "div.artdeco-dropdown__item, .artdeco-dropdown__item"
+                        ).filter(has_text=rx),
+                        "artdeco_item_in_menu",
+                    ),
+                ):
+                    if await _try_click(loc, strategy):
+                        clicked = True
+                        break
 
-        if not clicked:
-            loc = self.page.locator('[role="menuitem"]').filter(has_text=rx)
-            clicked = await _try_click(loc, "menuitem_page_fallback")
+            if not clicked:
+                dd = self.page.locator(".artdeco-dropdown__content--is-open")
+                if await dd.count() > 0:
+                    loc = dd.last.locator(
+                        "button, [role='menuitem'], .artdeco-dropdown__item, div[role='button']"
+                    ).filter(has_text=rx)
+                    clicked = await _try_click(loc, "artdeco_dropdown_open")
+
+            if not clicked:
+                loc = self.page.locator('[role="menuitem"]').filter(has_text=rx)
+                clicked = await _try_click(loc, "menuitem_page_fallback")
+
+            if clicked:
+                break
 
         if not clicked:
             msg = "copy_link_no_matching_control"

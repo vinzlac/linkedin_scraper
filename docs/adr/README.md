@@ -31,3 +31,5 @@ Chaque ADR suit le format :
 | [013](013-mcp-integration-architecture.md) | Architecture d'intégration MCP avec linkedin-mcp | Accepted |
 | [014](014-cdp-existing-browser.md) | Connexion CDP à un navigateur existant | Accepted |
 | [015](015-local-editable-install.md) | Installation editable locale plutôt que publication PyPI | Accepted |
+| [016](016-rate-limit-avoidance.md) | Stratégie multi-couches contre la détection et le rate limit LinkedIn | Accepted |
+| [017](017-remote-cdp-homelab-chromium.md) | Connexion CDP au Chromium partagé du homelab (k3s-homelab / OpenClaw Phase 10) | Accepted |

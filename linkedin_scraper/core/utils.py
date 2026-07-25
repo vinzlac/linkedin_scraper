@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional, TypeVar, cast
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from .exceptions import RateLimitError, ElementNotFoundError, NetworkError
+from .rate_limit_guard import record_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -54,38 +55,48 @@ def retry_async(
     return decorator
 
 
+def _raise_rate_limit(message: str, suggested_wait_time: int) -> None:
+    """Raise RateLimitError and persist a cross-process cooldown so a fresh
+    process (new script run, new MCP call) also backs off instead of
+    immediately retrying and compounding the problem."""
+    record_rate_limit(suggested_wait_time, reason=message)
+    raise RateLimitError(message, suggested_wait_time=suggested_wait_time)
+
+
 async def detect_rate_limit(page: Page) -> None:
     """
     Detect if LinkedIn has rate limited the session.
-    
+
     Args:
         page: Playwright page object
-        
+
     Raises:
         RateLimitError: If rate limiting is detected
     """
     # Check for common rate limit indicators
-    
+
     # Check URL for security challenges
     current_url = page.url
     if 'linkedin.com/checkpoint' in current_url or 'authwall' in current_url:
-        raise RateLimitError(
+        _raise_rate_limit(
             "LinkedIn security checkpoint detected. "
             "You may need to verify your identity or wait before continuing.",
             suggested_wait_time=3600  # 1 hour
         )
-    
+
     # Check for CAPTCHA
     try:
         captcha = await page.locator('iframe[title*="captcha" i], iframe[src*="captcha" i]').count()
         if captcha > 0:
-            raise RateLimitError(
+            _raise_rate_limit(
                 "CAPTCHA challenge detected. Manual intervention required.",
                 suggested_wait_time=3600
             )
+    except RateLimitError:
+        raise
     except Exception:
         pass
-    
+
     # Check for rate limit messages
     try:
         body_text = await page.locator('body').text_content(timeout=1000)
@@ -97,7 +108,7 @@ async def detect_rate_limit(page: Page) -> None:
                 'slow down',
                 'try again later'
             ]):
-                raise RateLimitError(
+                _raise_rate_limit(
                     "Rate limit message detected on page.",
                     suggested_wait_time=1800  # 30 minutes
                 )

@@ -29,6 +29,14 @@ from .utils import (
     handle_modal_close,
     is_page_loaded
 )
+from .rate_limit_guard import (
+    CooldownActiveError,
+    check_cooldown,
+    record_rate_limit,
+    enforce_write_action_pacing,
+    humanize_delay_ms,
+)
+from .permalink_cache import get_cached_permalink, save_cached_permalink
 
 __all__ = [
     # Browser
@@ -58,4 +66,13 @@ __all__ = [
     'click_see_more_buttons',
     'handle_modal_close',
     'is_page_loaded',
+    # Rate limit guard
+    'CooldownActiveError',
+    'check_cooldown',
+    'record_rate_limit',
+    'enforce_write_action_pacing',
+    'humanize_delay_ms',
+    # Permalink cache
+    'get_cached_permalink',
+    'save_cached_permalink',
 ]

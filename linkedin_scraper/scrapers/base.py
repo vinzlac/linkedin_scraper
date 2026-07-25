@@ -15,6 +15,7 @@ from ..core import (
     handle_modal_close,
     extract_text_safe,
     retry_async,
+    check_cooldown,
 )
 from ..core.exceptions import AuthenticationError, ScrapingError
 
@@ -162,6 +163,7 @@ class BaseScraper:
             wait_until: Wait condition (domcontentloaded, networkidle, load)
             timeout: Timeout in milliseconds (default: 60000 = 60s)
         """
+        check_cooldown()  # refuse to even start a request during an active cooldown
         logger.info(f"Navigating to: {url}")
         # Use type: ignore to bypass strict typing
         await self.page.goto(url, wait_until=wait_until, timeout=timeout)  # type: ignore
