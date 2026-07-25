@@ -108,7 +108,7 @@ Run `just` with no arguments to list all available commands.
 
 **From PyPI:**
 ```bash
-pip install linkedin-scraper
+pip install linkedin-playwright-scraper
 playwright install chromium
 ```
 

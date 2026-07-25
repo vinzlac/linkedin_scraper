@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "linkedin_scraper"
+name = "linkedin-playwright-scraper"
 version = "4.0.0"
 description = "Async LinkedIn scraper for profiles, companies, jobs and feed — Playwright-based"
 readme = "README.md"
