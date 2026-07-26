@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR-018](018-pypi-publication.md) — `linkedin-mcp` est désormais déployé sur k3s (build Docker sans accès à `../linkedin_scraper`), la clause de sortie "Quand passer à PyPI" ci-dessous s'est concrétisée.
 
 ## Context
 
