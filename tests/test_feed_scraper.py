@@ -291,6 +291,54 @@ class TestFeedScraperUnit:
         assert len(posts) == 1
 
 
+class TestExtractAuthorFromPostCardDom:
+    """Exercises the real DOM-scraping JS against a headless page.
+
+    Regression coverage for the 2026-08-05 report: LinkedIn's single-post
+    detail page (/posts/...) migrated to hashed atomic-CSS classes, so the
+    legacy .feed-shared-actor/.update-components-actor selectors match
+    nothing there, and the connected account's own promo/profile link
+    (visually first in the DOM) was being returned as the post author.
+    """
+
+    ATOMIC_CSS_PAGE_HTML = """
+    <html><body>
+      <a href="/posts/pierre-evrard-dashboard_share-7485978261278138368-33uY/"
+         class="_74151fd5 _3adf7052">
+        Essayez Premium All-in-One pour 0 &euro;
+      </a>
+      <a href="/in/vincent-lacoste-590a145/" class="_29e627b8 f5c61f47">
+        <span aria-hidden="true"></span>
+        Vincent Lacoste Architecte Applicatif, Technique &amp; Solution
+      </a>
+      <div class="_8342bca6 _30d5560e">
+        <a href="/in/pierre-evrard-dashboard/" class="a75602c0 d7b82b1d">
+          <span aria-hidden="true"></span>
+          Pierre Evrard &bull; 1er
+        </a>
+      </div>
+    </body></html>
+    """
+
+    @pytest.mark.asyncio
+    async def test_finds_real_author_via_degree_suffix_when_classes_are_hashed(self):
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(self.ATOMIC_CSS_PAGE_HTML)
+                scraper = FeedScraper(page)
+                result = await scraper._extract_author_from_post_card()
+            finally:
+                await browser.close()
+
+        assert result["name"] == "Pierre Evrard"
+        assert result["url"] == "https://www.linkedin.com/in/pierre-evrard-dashboard"
+        assert result["source"] == "degree_suffix_anchor"
+
+
 # ---------------------------------------------------------------------------
 # Integration tests (require a real LinkedIn session)
 # ---------------------------------------------------------------------------

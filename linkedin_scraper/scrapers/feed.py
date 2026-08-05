@@ -165,9 +165,8 @@ class FeedScraper(BaseScraper):
                 var m = href.match(/[/]in[/][^/?#]+/);
                 if (!m) return null;
                 var nameSpan = a.querySelector("span[aria-hidden='true']");
-                var name = nameSpan
-                    ? (nameSpan.innerText || "").trim()
-                    : (a.innerText || "").trim().split("\\n")[0].trim();
+                var nameSpanText = nameSpan ? (nameSpan.innerText || "").trim() : "";
+                var name = nameSpanText || (a.innerText || "").trim().split("\\n")[0].trim();
                 if (!name || name.length < 2) return null;
                 return { name: name, url: "https://www.linkedin.com" + m[0] };
             }
@@ -207,9 +206,8 @@ class FeedScraper(BaseScraper):
                 var m = href.match(/[/]in[/][^/?#]+/) || href.match(/[/]company[/][^/?#]+/);
                 if (!m) return null;
                 var nameSpan = a.querySelector("span[aria-hidden='true']");
-                var rawText = nameSpan
-                    ? (nameSpan.innerText || "").trim()
-                    : (a.innerText || "").trim();
+                var nameSpanText = nameSpan ? (nameSpan.innerText || "").trim() : "";
+                var rawText = nameSpanText || (a.innerText || "").trim();
                 var candidate = rawText.split("\\n")[0].trim()
                     .replace(/\\s*[^\\w\\s]\\s*(\\d+e(\\s+et\\s+\\+)?|Suivi|Following)[\\s\\S]*$/, "")
                     .trim();
@@ -271,6 +269,26 @@ class FeedScraper(BaseScraper):
             for (var pa = 0; pa < pageActors.length; pa++) {
                 var hit2 = extractFromActor(pageActors[pa], "page_actor_fallback");
                 if (hit2) return hit2;
+            }
+
+            // LinkedIn a migré certaines pages /posts/... vers un CSS atomisé
+            // (classes hashées, plus de .feed-shared-actor / data-view-name).
+            // Repli class-agnostic : l'ancre de l'acteur du post affiche le
+            // degré de connexion ("Nom • Suivi", "Nom • 1er", "Nom • 3e et +"),
+            // un motif stable indépendant des classes CSS.
+            var degreeRe = /\\u2022\\s*(Suivi|Following|\\d+e(\\s+et\\s+\\+)?|1er|1st|2nd|3rd)/i;
+            var candidateLinks = document.querySelectorAll("a[href*='/in/'], a[href*='/company/']");
+            for (var ci = 0; ci < candidateLinks.length; ci++) {
+                var candidate = candidateLinks[ci];
+                if (isGlobalChrome(candidate)) continue;
+                var nameSpan = candidate.querySelector("span[aria-hidden='true']");
+                var nameSpanText = nameSpan ? (nameSpan.innerText || "").trim() : "";
+                var rawCandidateText = nameSpanText || (candidate.innerText || "").trim();
+                if (!degreeRe.test(rawCandidateText)) continue;
+                var degreeProf = profileFromAnchor(candidate);
+                if (degreeProf) {
+                    return { name: degreeProf.name, url: degreeProf.url, source: "degree_suffix_anchor" };
+                }
             }
 
             return { name: null, url: null, source: "none" };
@@ -341,9 +359,8 @@ class FeedScraper(BaseScraper):
                 var m = href.match(/[/]in[/][^/?#]+/) || href.match(/[/]company[/][^/?#]+/);
                 if (!m) return null;
                 var nameSpan = a.querySelector("span[aria-hidden='true']");
-                var rawText = nameSpan
-                    ? (nameSpan.innerText || "").trim()
-                    : (a.innerText || "").trim();
+                var nameSpanText = nameSpan ? (nameSpan.innerText || "").trim() : "";
+                var rawText = nameSpanText || (a.innerText || "").trim();
                 var candidate = rawText.split("\\n")[0].trim()
                     .replace(/\\s*[^\\w\\s]\\s*(\\d+e(\\s+et\\s+\\+)?|Suivi|Following)[\\s\\S]*$/, "")
                     .trim();
@@ -744,7 +761,8 @@ class FeedScraper(BaseScraper):
                         var m = href.match(/[/]in[/][^/?#]+/);
                         if (!m) continue;
                         var nameSpan = inLinksAll[i].querySelector("span[aria-hidden='true']");
-                        var rawText = nameSpan ? (nameSpan.innerText || "").trim() : (inLinksAll[i].innerText || "").trim();
+                        var nameSpanText = nameSpan ? (nameSpan.innerText || "").trim() : "";
+                        var rawText = nameSpanText || (inLinksAll[i].innerText || "").trim();
                         var candidate = rawText.split("\\n")[0].trim()
                             .replace(/\\s*[^\\w\\s]\\s*(\\d+e(\\s+et\\s+\\+)?|Suivi|Following)[\\s\\S]*$/, "").trim();
                         if (candidate.toLowerCase() === actionTakerName) {
