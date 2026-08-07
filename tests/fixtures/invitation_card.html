@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="fr">
+  <body>
+    <div role="list">
+      <div role="listitem" data-invitation-id="inv-1">
+        <a href="https://www.linkedin.com/in/ada-lovelace/">Ada Lovelace</a>
+        <p>Engineer at Analytical Engine</p>
+        <p>3 relations en commun</p>
+        <p>
+          <span data-testid="expandable-text-box"
+            >Hello, interested in a backend role?</span
+          >
+        </p>
+        <button aria-label="Ignore invitation from Ada Lovelace">Ignore</button>
+        <button aria-label="Accept invitation from Ada Lovelace">Accept</button>
+      </div>
+      <div role="listitem" data-invitation-id="inv-2">
+        <a href="https://www.linkedin.com/in/grace-hopper/">Grace Hopper</a>
+        <p>Rear Admiral, USN</p>
+        <button aria-label="Ignorer l’invitation de Grace Hopper à rejoindre son réseau">
+          Ignorer
+        </button>
+        <button aria-label="Accepter l’invitation de Grace Hopper">Accepter</button>
+      </div>
+      <!-- Non-invitation listitem (nav/filter) should be skipped -->
+      <div role="listitem">
+        <span>Tout (29)</span>
+      </div>
+    </div>
+  </body>
+</html>
