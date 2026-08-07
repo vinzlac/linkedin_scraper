@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from playwright.async_api import Locator, Page
 
@@ -26,6 +26,14 @@ _SHARED_RE = re.compile(
 )
 _PROFILE_RE = re.compile(r"/in/([^/?#]+)/?", re.IGNORECASE)
 _COMPANY_RE = re.compile(r"/company/([^/?#]+)/?", re.IGNORECASE)
+# LinkedIn UI chrome on invitation cards (not the person's headline)
+_UI_CONTEXT_RE = re.compile(
+    r"(vous\s+invite\s+à\s+suivre|"
+    r"invited\s+you\s+to\s+follow|"
+    r"vous\s+a\s+invité|"
+    r"parce\s+que\s+vous\s+avez\s+interagi)",
+    re.IGNORECASE,
+)
 
 
 class InvitationScraper(BaseScraper):
@@ -48,6 +56,7 @@ class InvitationScraper(BaseScraper):
         await self._open_invitations_page()
         await self.ensure_logged_in()
         await self.check_rate_limit()
+        await self._scroll_to_load_invitations(target=limit)
         invitations = await self._extract_invitations(limit=limit)
         await self.callback.on_complete("Invitations", invitations)
         return invitations
@@ -64,6 +73,42 @@ class InvitationScraper(BaseScraper):
         if "/mynetwork/invitation-manager" not in (self.page.url or ""):
             await self.navigate_and_wait(INVITATIONS_URL)
         await self.page.wait_for_timeout(1500)
+        await self.check_rate_limit()
+
+    async def _scroll_to_load_invitations(self, target: int = 20, max_rounds: int = 25) -> None:
+        """Scroll the main content pane so LinkedIn lazy-loads invitation cards.
+
+        Window-level End is not enough: invitations load inside ``main``.
+        """
+        previous = -1
+        stable = 0
+        for _ in range(max_rounds):
+            count = await self.page.evaluate(
+                """() => [...document.querySelectorAll('button')].filter(b => {
+                    const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || '')).toLowerCase();
+                    return /\\b(accept|accepter)\\b/.test(label);
+                }).length"""
+            )
+            if count >= target:
+                break
+            if count == previous:
+                stable += 1
+                if stable >= 3:
+                    break
+            else:
+                stable = 0
+            previous = count
+            await self.page.evaluate(
+                """() => {
+                    const main = document.querySelector('main');
+                    if (main) {
+                        main.scrollTop = main.scrollHeight;
+                    } else {
+                        window.scrollTo(0, document.body.scrollHeight);
+                    }
+                }"""
+            )
+            await self.page.wait_for_timeout(500)
         await self.check_rate_limit()
 
     async def _extract_invitations(self, limit: int = 20) -> list[Invitation]:
@@ -145,7 +190,7 @@ class InvitationScraper(BaseScraper):
             return None
         path = urlparse(url).path
         m = _PROFILE_RE.search(path) or _COMPANY_RE.search(path)
-        return m.group(1) if m else None
+        return unquote(m.group(1)) if m else None
 
     @staticmethod
     def _slugify_name(name: Optional[str]) -> Optional[str]:
@@ -172,18 +217,24 @@ class InvitationScraper(BaseScraper):
         candidates: list[str] = []
         for line in lines:
             low = line.lower()
-            if profile_name and line == profile_name:
-                continue
+            if profile_name and (
+                line == profile_name or line.startswith(f"{profile_name} ")
+            ):
+                # Skip name + LinkedIn UI context glued on the same line
+                if line == profile_name or _UI_CONTEXT_RE.search(line):
+                    continue
             if low in skip:
                 continue
             if _SHARED_RE.search(line):
                 continue
             if _ACCEPT_RE.search(line) or _IGNORE_RE.search(line):
                 continue
+            if _UI_CONTEXT_RE.search(line):
+                continue
             candidates.append(line)
         if not candidates:
             return None
-        # First non-name line is typically the headline
+        # First remaining line is typically the headline
         return candidates[0]
 
     @staticmethod
@@ -204,19 +255,7 @@ class InvitationScraper(BaseScraper):
             text = re.sub(r"\s*[….]+\s*(voir plus|see more)\s*$", "", text, flags=re.I)
             if text:
                 return text
-
-        lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-        skip_exact = {x for x in (profile_name, headline) if x}
-        for line in lines:
-            low = line.lower()
-            if line in skip_exact:
-                continue
-            if _SHARED_RE.search(line):
-                continue
-            if low in {"ignorer", "accepter", "ignore", "accept"}:
-                continue
-            if len(line) > 40 and ("?" in line or "http" in low or "@" in line or "," in line):
-                return line
+        # Do not guess a message from headline/UI lines — only explicit intro notes.
         return None
 
     def _find_action_button(

@@ -55,6 +55,28 @@ async def test_parse_invitation_card_from_fixture():
 
 @pytest.mark.unit
 @pytest.mark.asyncio
+async def test_skip_follow_page_ui_context_as_headline():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.invitations import InvitationScraper
+
+    html = FIXTURE.read_text(encoding="utf-8")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        scraper = InvitationScraper(page)
+        cards = await scraper._extract_invitations(limit=10)
+        await browser.close()
+
+    kevin = next(c for c in cards if c.invitation_id == "kevin-rousseau01")
+    assert kevin.headline == "Founder @ VoiceStudio - AI video localization"
+    assert kevin.message is None
+    assert "suivre" not in (kevin.headline or "").lower()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
 async def test_find_accept_ignore_buttons_bilingual():
     from playwright.async_api import async_playwright
 
