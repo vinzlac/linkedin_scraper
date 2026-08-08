@@ -5,6 +5,8 @@ from .company import Company, CompanySummary, Employee
 from .job import Job
 from .post import Post
 from .invitation import Invitation
+from .conversation import Conversation
+from .message import Message
 
 __all__ = [
     "Person",
@@ -19,4 +21,6 @@ __all__ = [
     "Job",
     "Post",
     "Invitation",
+    "Conversation",
+    "Message",
 ]

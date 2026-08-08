@@ -8,6 +8,7 @@ from .job_search import JobSearchScraper
 from .company_posts import CompanyPostsScraper
 from .feed import FeedScraper
 from .invitations import InvitationScraper
+from .messaging import MessagingScraper
 
 __all__ = [
     'BaseScraper',
@@ -18,4 +19,5 @@ __all__ = [
     'CompanyPostsScraper',
     'FeedScraper',
     'InvitationScraper',
+    'MessagingScraper',
 ]

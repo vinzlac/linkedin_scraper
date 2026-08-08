@@ -35,6 +35,7 @@ from .scrapers import (
     CompanyPostsScraper,
     FeedScraper,
     InvitationScraper,
+    MessagingScraper,
 )
 
 # Callbacks
@@ -60,6 +61,8 @@ from .models import (
     Job,
     Post,
     Invitation,
+    Conversation,
+    Message,
 )
 
 __all__ = [
@@ -80,6 +83,7 @@ __all__ = [
     "CompanyPostsScraper",
     "FeedScraper",
     "InvitationScraper",
+    "MessagingScraper",
     # Exceptions
     "LinkedInScraperException",
     "AuthenticationError",
@@ -107,4 +111,6 @@ __all__ = [
     "Job",
     "Post",
     "Invitation",
+    "Conversation",
+    "Message",
 ]
