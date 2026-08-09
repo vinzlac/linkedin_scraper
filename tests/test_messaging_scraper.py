@@ -89,3 +89,44 @@ def test_conversation_id_from_url():
         MessagingScraper._conversation_id_from_url(url)
         == "2-ZTRmZGIyNmMtOWQ2Zi00ZWI2LTg3NzctMTRiY2RiMjc0YTg3XzEwMA=="
     )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_send_message_requires_text():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.core.exceptions import ScrapingError
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        scraper = MessagingScraper(page)
+        with pytest.raises(ScrapingError, match="text is required"):
+            await scraper.send_message("2-abc", "   ")
+        await browser.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_compose_editor_locator_from_fixture():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    html = """
+    <form class="msg-form">
+      <div class="msg-form__contenteditable" contenteditable="true" role="textbox"
+           aria-label="Rédigez un message…"></div>
+      <div class="msg-form__hint-text">Appuyez sur Entrée pour envoyer</div>
+    </form>
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        scraper = MessagingScraper(page)
+        editor = scraper._compose_editor()
+        assert await editor.count() == 1
+        await browser.close()

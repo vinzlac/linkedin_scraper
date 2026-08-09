@@ -1,4 +1,4 @@
-"""Scraper for LinkedIn messaging (read-only: list + get)."""
+"""Scraper for LinkedIn messaging (list, get, send)."""
 
 from __future__ import annotations
 
@@ -22,10 +22,11 @@ THREAD_URL_TMPL = "https://www.linkedin.com/messaging/thread/{conversation_id}/"
 
 _THREAD_RE = re.compile(r"/messaging/thread/([^/?#]+)/?", re.IGNORECASE)
 _UNREAD_RE = re.compile(r"(\d+)\s*(nouvelle|new)", re.IGNORECASE)
+_SEND_BUTTON_RE = re.compile(r"^(send|envoyer)$", re.IGNORECASE)
 
 
 class MessagingScraper(BaseScraper):
-    """Read LinkedIn conversations and messages via DOM scraping."""
+    """LinkedIn messaging via DOM scraping (list / get / send)."""
 
     def __init__(self, page: Page, callback: Optional[ProgressCallback] = None):
         super().__init__(page, callback or SilentCallback())
@@ -86,6 +87,104 @@ class MessagingScraper(BaseScraper):
         messages = await self._extract_messages(conversation_id, limit=limit)
         await self.callback.on_complete("MessagingThread", messages)
         return messages
+
+    async def send_message(self, conversation_id: str, text: str) -> bool:
+        """Send a text message in an existing conversation.
+
+        Opens the thread, types into the compose box, then sends via the
+        primary control (Envoyer/Send button if present, else Enter — LinkedIn
+        shows « Appuyez sur Entrée pour envoyer »).
+
+        Args:
+            conversation_id: Thread id from ``/messaging/thread/{id}/``.
+            text: Message body (non-empty).
+
+        Returns:
+            True if an outbound bubble matching the text appears after send.
+        """
+        if not conversation_id or not conversation_id.strip():
+            raise ScrapingError("conversation_id is required")
+        if not text or not text.strip():
+            raise ScrapingError("text is required")
+
+        conversation_id = unquote(conversation_id.strip())
+        text = text.strip()
+        url = THREAD_URL_TMPL.format(conversation_id=conversation_id)
+        logger.info("Sending message to conversation %s (%s chars)", conversation_id, len(text))
+        await self.callback.on_start("MessagingSend", url)
+        await self.navigate_and_wait(url)
+        await self.ensure_logged_in()
+        await self.check_rate_limit()
+        await self.page.wait_for_timeout(1500)
+
+        editor = self._compose_editor()
+        if await editor.count() == 0:
+            raise ScrapingError("Message compose editor not found")
+
+        await editor.click()
+        await self.page.wait_for_timeout(200)
+        # Clear any leftover draft
+        await self.page.keyboard.press("ControlOrMeta+A")
+        await self.page.keyboard.press("Backspace")
+        # Type so LinkedIn's Ember handlers enable send mode
+        await self.page.keyboard.type(text, delay=15)
+        await self.page.wait_for_timeout(400)
+
+        await self._click_send_or_enter()
+        await self.page.wait_for_timeout(1500)
+        await self.check_rate_limit()
+        ok = await self._outbound_contains(text)
+        await self.callback.on_complete("MessagingSend", ok)
+        return ok
+
+    def _compose_editor(self) -> Locator:
+        return self.page.locator(
+            '.msg-form__contenteditable[contenteditable="true"], '
+            '.msg-form__contenteditable[role="textbox"]'
+        ).first
+
+    async def _click_send_or_enter(self) -> bool:
+        """Prefer an explicit Send/Envoyer button; fall back to Enter."""
+        # Visible primary send button (some UIs / locales)
+        send_btn = self.page.get_by_role("button", name=_SEND_BUTTON_RE)
+        if await send_btn.count() > 0 and await send_btn.first.is_enabled():
+            await send_btn.first.click()
+            return True
+
+        # Class-based fallbacks seen on older layouts
+        class_btn = self.page.locator(
+            "button.msg-form__send-button, "
+            "button.msg-form__send-btn, "
+            '[data-test-msg-ui-send-button]'
+        ).first
+        if await class_btn.count() > 0 and await class_btn.is_enabled():
+            await class_btn.click()
+            return True
+
+        # Current LinkedIn FR UI: "Appuyez sur Entrée pour envoyer"
+        await self.page.keyboard.press("Enter")
+        return True
+
+    async def _outbound_contains(self, text: str) -> bool:
+        """Return True if a recent outbound bubble contains ``text``."""
+        needle = text.strip()
+        messages = await self._extract_messages(
+            self._conversation_id_from_url(self.page.url) or "",
+            limit=10,
+        )
+        for msg in reversed(messages):
+            if msg.direction != "outbound":
+                continue
+            if msg.text and needle in msg.text:
+                return True
+        # Fallback: any recent event body (direction detection may lag)
+        bodies = self.page.locator(".msg-s-event-listitem__body")
+        n = await bodies.count()
+        for i in range(max(0, n - 5), n):
+            body = (await bodies.nth(i).inner_text() or "").strip()
+            if needle in body:
+                return True
+        return False
 
     async def _open_messaging(self) -> None:
         if "/messaging" not in (self.page.url or ""):
