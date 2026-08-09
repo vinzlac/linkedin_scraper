@@ -39,14 +39,30 @@ class BaseScraper:
     async def ensure_logged_in(self) -> None:
         """
         Verify user is authenticated.
-        
+
+        Retries a few times before giving up: is_logged_in() checks for
+        rendered nav DOM elements right after navigate_and_wait(), which only
+        waits for `domcontentloaded` — on a cold browser start LinkedIn's SPA
+        nav bar may not have hydrated yet, causing a false "not logged in"
+        even with a fully valid session (the retry that follows on the
+        caller's side then succeeds, because by then the page has hydrated).
+
         Raises:
-            AuthenticationError: If not logged in
+            AuthenticationError: If still not logged in after retrying
         """
-        if not await is_logged_in(self.page):
-            raise AuthenticationError(
-                "Not logged in. Please authenticate before scraping."
+        delays = (0, 1.0, 2.0)
+        for attempt, delay in enumerate(delays):
+            if delay:
+                await asyncio.sleep(delay)
+            if await is_logged_in(self.page):
+                return
+            logger.debug(
+                "ensure_logged_in: pas encore connecté (essai %s/%s)",
+                attempt + 1, len(delays),
             )
+        raise AuthenticationError(
+            "Not logged in. Please authenticate before scraping."
+        )
     
     async def check_rate_limit(self) -> None:
         """
