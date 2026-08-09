@@ -126,12 +126,21 @@ class MessagingScraper(BaseScraper):
         # Clear any leftover draft
         await self.page.keyboard.press("ControlOrMeta+A")
         await self.page.keyboard.press("Backspace")
-        # Type so LinkedIn's Ember handlers enable send mode
-        await self.page.keyboard.type(text, delay=15)
+        # insert_text keeps newlines as characters (keyboard.type would
+        # press Enter for each "\n" and send prematurely).
+        await self.page.keyboard.insert_text(text)
         await self.page.wait_for_timeout(400)
 
+        # Nudge Ember that content changed (some builds ignore insert_text alone)
+        await editor.evaluate(
+            """(el) => {
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, data: el.innerText }));
+            }"""
+        )
+        await self.page.wait_for_timeout(300)
+
         await self._click_send_or_enter()
-        await self.page.wait_for_timeout(1500)
+        await self.page.wait_for_timeout(2000)
         await self.check_rate_limit()
         ok = await self._outbound_contains(text)
         await self.callback.on_complete("MessagingSend", ok)
