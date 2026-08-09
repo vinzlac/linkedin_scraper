@@ -1,13 +1,15 @@
-"""Scraper for LinkedIn messaging (read-only: list + get)."""
+"""Scraper for LinkedIn messaging (list, get, send)."""
 
 from __future__ import annotations
 
+import json
 import logging
 import re
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 from urllib.parse import unquote
 
-from playwright.async_api import Locator, Page
+from playwright.async_api import Locator, Page, Response
 
 from ..callbacks import ProgressCallback, SilentCallback
 from ..core.exceptions import ScrapingError
@@ -22,29 +24,91 @@ THREAD_URL_TMPL = "https://www.linkedin.com/messaging/thread/{conversation_id}/"
 
 _THREAD_RE = re.compile(r"/messaging/thread/([^/?#]+)/?", re.IGNORECASE)
 _UNREAD_RE = re.compile(r"(\d+)\s*(nouvelle|new)", re.IGNORECASE)
+_SEND_BUTTON_RE = re.compile(r"^(send|envoyer)$", re.IGNORECASE)
 
 
 class MessagingScraper(BaseScraper):
-    """Read LinkedIn conversations and messages via DOM scraping."""
+    """LinkedIn messaging via DOM scraping (list / get / send)."""
 
     def __init__(self, page: Page, callback: Optional[ProgressCallback] = None):
         super().__init__(page, callback or SilentCallback())
 
-    async def list_recent(self, limit: int = 20) -> list[Conversation]:
-        """List recent conversations from the messaging inbox."""
-        logger.info("Listing recent conversations (limit=%s)", limit)
-        await self.callback.on_start("Messaging", MESSAGING_URL)
-        await self._open_messaging()
-        await self.ensure_logged_in()
-        await self.check_rate_limit()
-        await self._scroll_conversation_list(target=limit)
+    async def list_recent(
+        self, limit: int = 20, *, allow_click_resolve: bool = False
+    ) -> list[Conversation]:
+        """List recent conversations from the messaging inbox.
 
+        Resolves ``conversation_id`` from the ``messengerConversations`` GraphQL
+        payload captured while loading ``/messaging/`` — **without clicking**
+        list items (clicking marks conversations as read on LinkedIn).
+
+        Args:
+            limit: Max conversations to return.
+            allow_click_resolve: If True and GraphQL capture fails, fall back to
+                clicking each row (marks as read). Default False.
+        """
+        logger.info(
+            "Listing recent conversations (limit=%s, allow_click_resolve=%s)",
+            limit,
+            allow_click_resolve,
+        )
+        await self.callback.on_start("Messaging", MESSAGING_URL)
+
+        payloads: list[dict[str, Any]] = []
+
+        async def _on_response(response: Response) -> None:
+            try:
+                url = response.url
+                if "messengerConversations" not in url:
+                    return
+                if response.status != 200:
+                    return
+                data = await response.json()
+                if isinstance(data, dict):
+                    payloads.append(data)
+            except Exception as exc:
+                logger.debug("Ignoring messaging API response: %s", exc)
+
+        self.page.on("response", _on_response)
+        try:
+            await self._open_messaging()
+            await self.ensure_logged_in()
+            await self.check_rate_limit()
+            # Give GraphQL time to land; scroll may trigger another page of results
+            await self.page.wait_for_timeout(2000)
+            await self._scroll_conversation_list(target=limit)
+            await self.page.wait_for_timeout(1500)
+        finally:
+            self.page.remove_listener("response", _on_response)
+
+        results = self._conversations_from_graphql_payloads(payloads, limit=limit)
+        if results:
+            await self.callback.on_complete("Messaging", results)
+            logger.info("Listed %s conversations via GraphQL (no click)", len(results))
+            return results
+
+        if not allow_click_resolve:
+            raise ScrapingError(
+                "Could not capture messengerConversations GraphQL payload. "
+                "Retry, or call list_recent(allow_click_resolve=True) "
+                "(warning: clicking marks conversations as read)."
+            )
+
+        logger.warning(
+            "GraphQL capture empty — falling back to click resolve (marks as read)"
+        )
+        results = await self._list_recent_via_click(limit=limit)
+        await self.callback.on_complete("Messaging", results)
+        logger.info("Listed %s conversations via click fallback", len(results))
+        return results
+
+    async def _list_recent_via_click(self, limit: int = 20) -> list[Conversation]:
+        """Legacy path: click each row to read thread id (marks as read)."""
         items = self.page.locator("li.msg-conversation-listitem")
         count = await items.count()
         results: list[Conversation] = []
 
         for i in range(min(count, limit)):
-            # Re-query — DOM can refresh after clicks
             item = self.page.locator("li.msg-conversation-listitem").nth(i)
             meta = await self._parse_list_item(item)
             conversation_id = await self._resolve_conversation_id(item)
@@ -62,10 +126,120 @@ class MessagingScraper(BaseScraper):
                     raw_item_text=meta.get("raw_item_text"),
                 )
             )
-
-        await self.callback.on_complete("Messaging", results)
-        logger.info("Listed %s conversations", len(results))
         return results
+
+    @staticmethod
+    def _conversations_from_graphql_payloads(
+        payloads: list[dict[str, Any]], limit: int = 20
+    ) -> list[Conversation]:
+        seen: set[str] = set()
+        results: list[Conversation] = []
+        for payload in payloads:
+            for element in MessagingScraper._iter_conversation_elements(payload):
+                conv = MessagingScraper._conversation_from_api_element(element)
+                if conv is None or conv.conversation_id in seen:
+                    continue
+                seen.add(conv.conversation_id)
+                results.append(conv)
+                if len(results) >= limit:
+                    return results
+        return results
+
+    @staticmethod
+    def _iter_conversation_elements(obj: Any):
+        """Yield conversation dicts that include conversationUrl / unreadCount."""
+        if isinstance(obj, dict):
+            if "conversationUrl" in obj or (
+                "unreadCount" in obj and "backendUrn" in obj
+            ):
+                yield obj
+            for value in obj.values():
+                yield from MessagingScraper._iter_conversation_elements(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                yield from MessagingScraper._iter_conversation_elements(item)
+
+    @staticmethod
+    def _conversation_from_api_element(element: dict[str, Any]) -> Optional[Conversation]:
+        url = element.get("conversationUrl") or ""
+        conversation_id = MessagingScraper._conversation_id_from_url(url)
+        if not conversation_id:
+            backend = element.get("backendUrn") or ""
+            m = re.search(r"messagingThread:(2-[^\s\"']+)", backend)
+            if m:
+                conversation_id = unquote(m.group(1))
+        if not conversation_id:
+            return None
+
+        name, profile_url = MessagingScraper._participant_from_api(element)
+        preview = MessagingScraper._preview_from_api(element)
+        unread = element.get("unreadCount")
+        if unread is not None:
+            try:
+                unread = int(unread)
+            except (TypeError, ValueError):
+                unread = None
+
+        activity = element.get("lastActivityAt")
+        last_activity_at = None
+        if isinstance(activity, (int, float)):
+            last_activity_at = datetime.fromtimestamp(
+                activity / 1000.0, tz=timezone.utc
+            ).isoformat()
+
+        return Conversation(
+            conversation_id=conversation_id,
+            participant_name=name,
+            participant_url=profile_url,
+            last_message_preview=preview,
+            last_activity_at=last_activity_at,
+            unread_count=unread,
+            raw_item_text=json.dumps(
+                {
+                    "entityUrn": element.get("entityUrn"),
+                    "backendUrn": element.get("backendUrn"),
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+    @staticmethod
+    def _participant_from_api(
+        element: dict[str, Any],
+    ) -> tuple[Optional[str], Optional[str]]:
+        participants = element.get("conversationParticipants") or []
+        for participant in participants:
+            member = (
+                (participant.get("participantType") or {}).get("member")
+                if isinstance(participant, dict)
+                else None
+            )
+            if not isinstance(member, dict):
+                continue
+            if member.get("distance") == "SELF":
+                continue
+            first = ((member.get("firstName") or {}).get("text") or "").strip()
+            last = ((member.get("lastName") or {}).get("text") or "").strip()
+            name = f"{first} {last}".strip() or None
+            url = member.get("profileUrl")
+            return name, url
+        return None, None
+
+    @staticmethod
+    def _preview_from_api(element: dict[str, Any]) -> Optional[str]:
+        messages = element.get("messages")
+        if isinstance(messages, dict):
+            elements = messages.get("elements") or []
+            if elements and isinstance(elements[0], dict):
+                body = elements[0].get("body") or {}
+                if isinstance(body, dict):
+                    text = (body.get("text") or "").strip()
+                    if text:
+                        return text
+                fallback = (elements[0].get("renderContentFallbackText") or "").strip()
+                if fallback:
+                    return fallback
+        return None
 
     async def get_conversation(
         self, conversation_id: str, limit: int = 50
@@ -86,6 +260,119 @@ class MessagingScraper(BaseScraper):
         messages = await self._extract_messages(conversation_id, limit=limit)
         await self.callback.on_complete("MessagingThread", messages)
         return messages
+
+    async def send_message(self, conversation_id: str, text: str) -> bool:
+        """Send a text message in an existing conversation.
+
+        Opens the thread, types into the compose box, then sends via the
+        primary control (Envoyer/Send button if present, else Enter — LinkedIn
+        shows « Appuyez sur Entrée pour envoyer »).
+
+        Args:
+            conversation_id: Thread id from ``/messaging/thread/{id}/``.
+            text: Message body (non-empty).
+
+        Returns:
+            True if an outbound bubble matching the text appears after send.
+        """
+        if not conversation_id or not conversation_id.strip():
+            raise ScrapingError("conversation_id is required")
+        if not text or not text.strip():
+            raise ScrapingError("text is required")
+
+        conversation_id = unquote(conversation_id.strip())
+        text = text.strip()
+        url = THREAD_URL_TMPL.format(conversation_id=conversation_id)
+        logger.info("Sending message to conversation %s (%s chars)", conversation_id, len(text))
+        await self.callback.on_start("MessagingSend", url)
+        await self.navigate_and_wait(url)
+        await self.ensure_logged_in()
+        await self.check_rate_limit()
+        await self.page.wait_for_timeout(1500)
+
+        editor = self._compose_editor()
+        if await editor.count() == 0:
+            raise ScrapingError("Message compose editor not found")
+
+        await editor.click()
+        await self.page.wait_for_timeout(200)
+        # Clear any leftover draft
+        await self.page.keyboard.press("ControlOrMeta+A")
+        await self.page.keyboard.press("Backspace")
+        # insert_text keeps newlines as characters (keyboard.type would
+        # press Enter for each "\n" and send prematurely).
+        await self.page.keyboard.insert_text(text)
+        await self.page.wait_for_timeout(400)
+
+        # Nudge Ember that content changed (some builds ignore insert_text alone)
+        await editor.evaluate(
+            """(el) => {
+                el.dispatchEvent(new InputEvent('input', { bubbles: true, data: el.innerText }));
+            }"""
+        )
+        await self.page.wait_for_timeout(300)
+
+        await self._click_send_or_enter()
+        await self.page.wait_for_timeout(2000)
+        # Confirm delivery first: latent reCAPTCHA iframes on /messaging/
+        # used to make post-send check_rate_limit() raise even when the
+        # outbound bubble was already present (false failure).
+        ok = await self._outbound_contains(text)
+        if ok:
+            await self.callback.on_complete("MessagingSend", True)
+            return True
+        await self.check_rate_limit()
+        await self.callback.on_complete("MessagingSend", False)
+        return False
+
+    def _compose_editor(self) -> Locator:
+        return self.page.locator(
+            '.msg-form__contenteditable[contenteditable="true"], '
+            '.msg-form__contenteditable[role="textbox"]'
+        ).first
+
+    async def _click_send_or_enter(self) -> bool:
+        """Prefer an explicit Send/Envoyer button; fall back to Enter."""
+        # Visible primary send button (some UIs / locales)
+        send_btn = self.page.get_by_role("button", name=_SEND_BUTTON_RE)
+        if await send_btn.count() > 0 and await send_btn.first.is_enabled():
+            await send_btn.first.click()
+            return True
+
+        # Class-based fallbacks seen on older layouts
+        class_btn = self.page.locator(
+            "button.msg-form__send-button, "
+            "button.msg-form__send-btn, "
+            '[data-test-msg-ui-send-button]'
+        ).first
+        if await class_btn.count() > 0 and await class_btn.is_enabled():
+            await class_btn.click()
+            return True
+
+        # Current LinkedIn FR UI: "Appuyez sur Entrée pour envoyer"
+        await self.page.keyboard.press("Enter")
+        return True
+
+    async def _outbound_contains(self, text: str) -> bool:
+        """Return True if a recent outbound bubble contains ``text``."""
+        needle = text.strip()
+        messages = await self._extract_messages(
+            self._conversation_id_from_url(self.page.url) or "",
+            limit=10,
+        )
+        for msg in reversed(messages):
+            if msg.direction != "outbound":
+                continue
+            if msg.text and needle in msg.text:
+                return True
+        # Fallback: any recent event body (direction detection may lag)
+        bodies = self.page.locator(".msg-s-event-listitem__body")
+        n = await bodies.count()
+        for i in range(max(0, n - 5), n):
+            body = (await bodies.nth(i).inner_text() or "").strip()
+            if needle in body:
+                return True
+        return False
 
     async def _open_messaging(self) -> None:
         if "/messaging" not in (self.page.url or ""):

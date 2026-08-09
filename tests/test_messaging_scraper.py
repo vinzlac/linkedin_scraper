@@ -89,3 +89,100 @@ def test_conversation_id_from_url():
         MessagingScraper._conversation_id_from_url(url)
         == "2-ZTRmZGIyNmMtOWQ2Zi00ZWI2LTg3NzctMTRiY2RiMjc0YTg3XzEwMA=="
     )
+
+
+@pytest.mark.unit
+def test_conversations_from_graphql_payload_no_click():
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    payload = {
+        "data": {
+            "messengerConversationsBySyncToken": {
+                "elements": [
+                    {
+                        "conversationUrl": (
+                            "https://www.linkedin.com/messaging/thread/"
+                            "2-abc123==/"
+                        ),
+                        "unreadCount": 2,
+                        "lastActivityAt": 1786273523965,
+                        "backendUrn": "urn:li:messagingThread:2-abc123==",
+                        "conversationParticipants": [
+                            {
+                                "participantType": {
+                                    "member": {
+                                        "distance": "SELF",
+                                        "firstName": {"text": "Vincent"},
+                                        "lastName": {"text": "Lacoste"},
+                                    }
+                                }
+                            },
+                            {
+                                "participantType": {
+                                    "member": {
+                                        "distance": "DISTANCE_2",
+                                        "firstName": {"text": "Ada"},
+                                        "lastName": {"text": "Lovelace"},
+                                        "profileUrl": "https://www.linkedin.com/in/ada/",
+                                    }
+                                }
+                            },
+                        ],
+                        "messages": {
+                            "elements": [
+                                {"body": {"text": "Hello about the engine"}}
+                            ]
+                        },
+                    }
+                ]
+            }
+        }
+    }
+    convs = MessagingScraper._conversations_from_graphql_payloads([payload], limit=10)
+    assert len(convs) == 1
+    assert convs[0].conversation_id == "2-abc123=="
+    assert convs[0].participant_name == "Ada Lovelace"
+    assert convs[0].unread_count == 2
+    assert convs[0].last_message_preview == "Hello about the engine"
+    assert convs[0].participant_url == "https://www.linkedin.com/in/ada/"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_send_message_requires_text():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.core.exceptions import ScrapingError
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        scraper = MessagingScraper(page)
+        with pytest.raises(ScrapingError, match="text is required"):
+            await scraper.send_message("2-abc", "   ")
+        await browser.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_compose_editor_locator_from_fixture():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    html = """
+    <form class="msg-form">
+      <div class="msg-form__contenteditable" contenteditable="true" role="textbox"
+           aria-label="Rédigez un message…"></div>
+      <div class="msg-form__hint-text">Appuyez sur Entrée pour envoyer</div>
+    </form>
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        scraper = MessagingScraper(page)
+        editor = scraper._compose_editor()
+        assert await editor.count() == 1
+        await browser.close()
