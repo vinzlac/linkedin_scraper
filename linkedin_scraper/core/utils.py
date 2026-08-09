@@ -63,6 +63,63 @@ def _raise_rate_limit(message: str, suggested_wait_time: int) -> None:
     raise RateLimitError(message, suggested_wait_time=suggested_wait_time)
 
 
+async def _has_blocking_security_challenge(page: Page) -> bool:
+    """Return True only for an *active* LinkedIn security/CAPTCHA challenge.
+
+    Messaging pages often embed a latent Google reCAPTCHA enterprise iframe
+    (and sometimes a protechts frame) even when the UI is fully usable.
+    Counting those iframes alone caused false RateLimitError after successful
+    actions such as ``send_message``.
+    """
+    # Explicit challenge / interstitial URLs
+    url = (page.url or "").lower()
+    if "linkedin.com/checkpoint" in url or "authwall" in url:
+        return True
+
+    # Active LinkedIn security verification overlay (not tiny latent widgets)
+    try:
+        frames = page.locator(
+            'iframe[title*="security verification" i], '
+            'iframe[src*="protechts.net" i]'
+        )
+        count = await frames.count()
+        for i in range(count):
+            frame = frames.nth(i)
+            if not await frame.is_visible():
+                continue
+            box = await frame.bounding_box()
+            if not box:
+                continue
+            # Latent embeds are usually small anchors; blocking UI is large.
+            if box.get("width", 0) >= 200 and box.get("height", 0) >= 200:
+                src = (await frame.get_attribute("src") or "").lower()
+                title = (await frame.get_attribute("title") or "").lower()
+                if (
+                    "security verification" in title
+                    or "uc=scraping" in src
+                    or "protechts.net" in src
+                ):
+                    return True
+    except Exception:
+        pass
+
+    # Visible challenge dialog (not a background recaptcha anchor)
+    try:
+        for phrase in (
+            "security verification",
+            "vérification de sécurité",
+            "unusual activity",
+            "activité inhabituelle",
+        ):
+            dlg = page.locator(f'[role="dialog"]:has-text("{phrase}")')
+            if await dlg.count() > 0 and await dlg.first.is_visible():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
 async def detect_rate_limit(page: Page) -> None:
     """
     Detect if LinkedIn has rate limited the session.
@@ -84,10 +141,9 @@ async def detect_rate_limit(page: Page) -> None:
             suggested_wait_time=3600  # 1 hour
         )
 
-    # Check for CAPTCHA
+    # Active CAPTCHA / security challenge only (ignore latent reCAPTCHA iframes)
     try:
-        captcha = await page.locator('iframe[title*="captcha" i], iframe[src*="captcha" i]').count()
-        if captcha > 0:
+        if await _has_blocking_security_challenge(page):
             _raise_rate_limit(
                 "CAPTCHA challenge detected. Manual intervention required.",
                 suggested_wait_time=3600

@@ -314,10 +314,16 @@ class MessagingScraper(BaseScraper):
 
         await self._click_send_or_enter()
         await self.page.wait_for_timeout(2000)
-        await self.check_rate_limit()
+        # Confirm delivery first: latent reCAPTCHA iframes on /messaging/
+        # used to make post-send check_rate_limit() raise even when the
+        # outbound bubble was already present (false failure).
         ok = await self._outbound_contains(text)
-        await self.callback.on_complete("MessagingSend", ok)
-        return ok
+        if ok:
+            await self.callback.on_complete("MessagingSend", True)
+            return True
+        await self.check_rate_limit()
+        await self.callback.on_complete("MessagingSend", False)
+        return False
 
     def _compose_editor(self) -> Locator:
         return self.page.locator(
