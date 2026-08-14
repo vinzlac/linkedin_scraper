@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from typing import Literal, Optional
 from urllib.parse import unquote, urlparse
 
@@ -11,7 +12,7 @@ from playwright.async_api import Locator, Page
 
 from ..callbacks import ProgressCallback, SilentCallback
 from ..core.exceptions import ScrapingError
-from ..models.invitation import Invitation
+from ..models.invitation import Invitation, InvitationKind
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,37 @@ _SHARED_RE = re.compile(
 )
 _PROFILE_RE = re.compile(r"/in/([^/?#]+)/?", re.IGNORECASE)
 _COMPANY_RE = re.compile(r"/company/([^/?#]+)/?", re.IGNORECASE)
+_NEWSLETTER_RE = re.compile(r"/newsletters/([^/?#]+)/?", re.IGNORECASE)
+_FOLLOW_RE = re.compile(
+    r"(vous\s+a\s+invité(?:\(e\))?\s+à\s+suivre|"
+    r"vous\s+invite\s+à\s+suivre|"
+    r"invited\s+you\s+to\s+follow)",
+    re.IGNORECASE,
+)
+_FOLLOW_PAGE_RE = re.compile(
+    r"(suivre\s+sa\s+page|follow\s+(?:their|his|her|your)\s+page)",
+    re.IGNORECASE,
+)
+_CONNECT_RE = re.compile(
+    r"(rejoindre\s+(?:son|votre|leur)\s+réseau|"
+    r"invited\s+you\s+to\s+(?:connect|join\s+(?:their|his|her)\s+network))",
+    re.IGNORECASE,
+)
+_NEWSLETTER_HINT_RE = re.compile(r"\bnewsletter\b", re.IGNORECASE)
+_FOLLOW_TARGET_RE = re.compile(
+    r"(?:vous\s+a\s+invité(?:\(e\))?\s+à\s+suivre|"
+    r"vous\s+invite\s+à\s+suivre|"
+    r"invited\s+you\s+to\s+follow)\s+(?P<target>.+)",
+    re.IGNORECASE,
+)
+_INVITER_PREFIX_RE = re.compile(
+    r"^(?P<name>.+?)\s+(?:vous\s+a\s+invité|vous\s+invite|invited\s+you)\b",
+    re.IGNORECASE,
+)
+_GENERIC_PAGE_TARGET_RE = re.compile(
+    r"^(sa|son|leur|your|their|his|her)\s+page$",
+    re.IGNORECASE,
+)
 # LinkedIn UI chrome on invitation cards (not the person's headline)
 _UI_CONTEXT_RE = re.compile(
     r"(vous\s+invite\s+à\s+suivre|"
@@ -34,6 +66,206 @@ _UI_CONTEXT_RE = re.compile(
     r"parce\s+que\s+vous\s+avez\s+interagi)",
     re.IGNORECASE,
 )
+
+
+@dataclass
+class _EntityLink:
+    url: str
+    name: Optional[str] = None
+
+
+@dataclass
+class _ClassifiedInvitation:
+    invitation_id: Optional[str]
+    invitation_kind: InvitationKind
+    inviter_name: Optional[str]
+    inviter_url: Optional[str]
+    target_name: Optional[str]
+    target_url: Optional[str]
+    display_text: Optional[str]
+    profile_name: Optional[str]
+    profile_url: Optional[str]
+
+
+def classify_invitation(
+    raw_text: str,
+    persons: list[_EntityLink],
+    companies: list[_EntityLink],
+    newsletters: list[_EntityLink],
+) -> _ClassifiedInvitation:
+    """Derive invitation subtype + inviter/target from card text and entity links."""
+    display_text = _extract_display_text(raw_text)
+    person = _first_named(persons)
+    company = _first_named(companies)
+    newsletter = _first_named(newsletters)
+    text_target = _follow_target_from_text(raw_text)
+
+    is_follow = bool(_FOLLOW_RE.search(raw_text) or _FOLLOW_PAGE_RE.search(raw_text))
+    is_connect = bool(_CONNECT_RE.search(raw_text))
+    is_newsletter = bool(newsletter) or (
+        bool(_NEWSLETTER_HINT_RE.search(raw_text)) and not person
+    )
+
+    if is_newsletter or newsletter:
+        kind: InvitationKind = "follow_newsletter"
+        target = newsletter or company
+        inviter = person or target
+        invitation_id = _id_from_url(target.url if target else None) or _id_from_url(
+            person.url if person else None
+        )
+        target_name = (target.name if target else None) or text_target
+        target_url = target.url if target else None
+    elif company and (is_follow or not person):
+        kind = "follow_company"
+        inviter = person or company
+        target = company
+        invitation_id = _id_from_url(company.url) or _id_from_url(
+            person.url if person else None
+        )
+        target_name = company.name or text_target
+        target_url = company.url
+    elif is_follow and person and not company:
+        if _FOLLOW_PAGE_RE.search(raw_text):
+            kind = "follow_company"
+        else:
+            kind = "follow_person"
+        inviter = person
+        target = person if kind == "follow_person" else None
+        invitation_id = _id_from_url(person.url)
+        target_name = (target.name if target else None) or text_target
+        target_url = target.url if target else None
+    elif person and (is_connect or not is_follow):
+        kind = "connection"
+        inviter = person
+        target = person
+        invitation_id = _id_from_url(person.url)
+        target_name = person.name
+        target_url = person.url
+    elif company:
+        kind = "follow_company"
+        inviter = company
+        target = company
+        invitation_id = _id_from_url(company.url)
+        target_name = company.name
+        target_url = company.url
+    else:
+        kind = "unknown"
+        inviter = person
+        target = person or company
+        invitation_id = _id_from_url(person.url if person else None) or _id_from_url(
+            company.url if company else None
+        )
+        target_name = target.name if target else text_target
+        target_url = target.url if target else None
+
+    inviter_name = inviter.name if inviter else _inviter_from_text(raw_text)
+    inviter_url = inviter.url if inviter else None
+
+    # Retrocompat: profile_* stay on the person when present (inviter), else the target.
+    if person:
+        profile_name, profile_url = person.name, person.url
+    elif company:
+        profile_name, profile_url = company.name, company.url
+    elif newsletter:
+        profile_name, profile_url = newsletter.name, newsletter.url
+    else:
+        profile_name, profile_url = inviter_name, inviter_url
+
+    if not invitation_id:
+        invitation_id = _slugify_name(target_name or inviter_name or profile_name)
+
+    return _ClassifiedInvitation(
+        invitation_id=invitation_id,
+        invitation_kind=kind,
+        inviter_name=inviter_name,
+        inviter_url=inviter_url,
+        target_name=target_name,
+        target_url=target_url,
+        display_text=display_text,
+        profile_name=profile_name,
+        profile_url=profile_url,
+    )
+
+
+def _first_named(links: list[_EntityLink]) -> Optional[_EntityLink]:
+    for link in links:
+        if link.name:
+            return link
+    return links[0] if links else None
+
+
+def _extract_display_text(raw_text: str) -> Optional[str]:
+    for line in raw_text.splitlines():
+        collapsed = " ".join(line.split())
+        if not collapsed:
+            continue
+        if _FOLLOW_RE.search(collapsed) or _CONNECT_RE.search(collapsed):
+            collapsed = re.split(
+                r"\s+parce\s+que\s+|\s+because\s+",
+                collapsed,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+            return collapsed or None
+    return None
+
+
+def _follow_target_from_text(raw_text: str) -> Optional[str]:
+    m = _FOLLOW_TARGET_RE.search(" ".join(raw_text.split()))
+    if not m:
+        return None
+    target = m.group("target").strip()
+    target = re.split(r"\s+parce\s+que\s+|\s+because\s+", target, maxsplit=1, flags=re.I)[
+        0
+    ].strip()
+    if not target or _GENERIC_PAGE_TARGET_RE.match(target):
+        return None
+    return target
+
+
+def _inviter_from_text(raw_text: str) -> Optional[str]:
+    for line in raw_text.splitlines():
+        collapsed = " ".join(line.split())
+        m = _INVITER_PREFIX_RE.match(collapsed)
+        if m:
+            return m.group("name").strip() or None
+    return None
+
+
+def _slugify_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    slug = re.sub(r"\s+", "-", name.strip().lower())
+    slug = re.sub(r"[^a-z0-9\-._]", "", slug)
+    return slug or None
+
+
+def _id_from_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    path = urlparse(url).path
+    m = (
+        _PROFILE_RE.search(path)
+        or _COMPANY_RE.search(path)
+        or _NEWSLETTER_RE.search(path)
+    )
+    return unquote(m.group(1)) if m else None
+
+
+def _normalize_href(href: str) -> str:
+    if href.startswith("/"):
+        href = f"https://www.linkedin.com{href}"
+    return href.split("?")[0]
+
+
+def _clean_link_name(text: str) -> Optional[str]:
+    collapsed = " ".join((text or "").split()).strip()
+    if not collapsed:
+        return None
+    if _FOLLOW_RE.search(collapsed) or _CONNECT_RE.search(collapsed):
+        m = _INVITER_PREFIX_RE.match(collapsed)
+        return m.group("name").strip() if m else None
+    return collapsed
 
 
 class InvitationScraper(BaseScraper):
@@ -140,68 +372,104 @@ class InvitationScraper(BaseScraper):
 
     async def _parse_card(self, card: Locator) -> Optional[Invitation]:
         raw_text = (await card.inner_text() or "").strip()
-        profile_url, profile_name = await self._extract_profile(card)
+        persons, companies, newsletters = await self._extract_entity_links(card)
+        classified = classify_invitation(raw_text, persons, companies, newsletters)
 
         data_id = await card.get_attribute("data-invitation-id")
-        invitation_id = data_id or self._id_from_url(profile_url) or self._slugify_name(
-            profile_name
-        )
+        invitation_id = data_id or classified.invitation_id
         if not invitation_id:
             logger.debug("Skipping card without invitation_id: %r", raw_text[:80])
             return None
 
-        headline = self._extract_headline(raw_text, profile_name)
+        skip_names = {
+            n
+            for n in (
+                classified.profile_name,
+                classified.inviter_name,
+                classified.target_name,
+                classified.display_text,
+            )
+            if n
+        }
+        headline = self._extract_headline(raw_text, classified.profile_name, skip_names)
         shared = self._extract_shared_count(raw_text)
-        message = await self._extract_message(card, raw_text, profile_name, headline)
+        message = await self._extract_message(
+            card, raw_text, classified.profile_name, headline
+        )
 
         return Invitation(
             invitation_id=invitation_id,
-            profile_name=profile_name,
-            profile_url=profile_url,
+            profile_name=classified.profile_name,
+            profile_url=classified.profile_url,
             headline=headline,
             shared_connection_count=shared,
             message=message,
+            invitation_kind=classified.invitation_kind,
+            inviter_name=classified.inviter_name,
+            inviter_url=classified.inviter_url,
+            target_name=classified.target_name,
+            target_url=classified.target_url,
+            display_text=classified.display_text,
             raw_card_text=raw_text,
         )
 
-    async def _extract_profile(self, card: Locator) -> tuple[Optional[str], Optional[str]]:
-        links = card.locator('a[href*="/in/"], a[href*="/company/"]')
+    async def _extract_entity_links(
+        self, card: Locator
+    ) -> tuple[list[_EntityLink], list[_EntityLink], list[_EntityLink]]:
+        links = card.locator(
+            'a[href*="/in/"], a[href*="/company/"], a[href*="/newsletters/"]'
+        )
+        persons: list[_EntityLink] = []
+        companies: list[_EntityLink] = []
+        newsletters: list[_EntityLink] = []
         n = await links.count()
-        best_url: Optional[str] = None
-        best_name: Optional[str] = None
         for i in range(n):
             link = links.nth(i)
             href = await link.get_attribute("href")
-            text = (await link.inner_text() or "").strip()
             if not href:
                 continue
-            if href.startswith("/"):
-                href = f"https://www.linkedin.com{href}"
-            if best_url is None:
-                best_url = href.split("?")[0]
-            if text and (best_name is None or len(text) > len(best_name)):
-                best_name = text
-                best_url = href.split("?")[0]
-        return best_url, best_name
+            url = _normalize_href(href)
+            name = _clean_link_name(await link.inner_text() or "")
+            path = urlparse(url).path
+            if _NEWSLETTER_RE.search(path):
+                self._merge_entity(newsletters, url, name)
+            elif _COMPANY_RE.search(path):
+                self._merge_entity(companies, url, name)
+            elif _PROFILE_RE.search(path):
+                self._merge_entity(persons, url, name)
+        return persons, companies, newsletters
+
+    @staticmethod
+    def _merge_entity(bucket: list[_EntityLink], url: str, name: Optional[str]) -> None:
+        for existing in bucket:
+            if existing.url == url:
+                if name and not existing.name:
+                    existing.name = name
+                elif (
+                    name
+                    and existing.name
+                    and len(name) < len(existing.name)
+                    and not _FOLLOW_RE.search(name)
+                    and not _CONNECT_RE.search(name)
+                ):
+                    existing.name = name
+                return
+        bucket.append(_EntityLink(url=url, name=name))
 
     @staticmethod
     def _id_from_url(url: Optional[str]) -> Optional[str]:
-        if not url:
-            return None
-        path = urlparse(url).path
-        m = _PROFILE_RE.search(path) or _COMPANY_RE.search(path)
-        return unquote(m.group(1)) if m else None
+        return _id_from_url(url)
 
     @staticmethod
     def _slugify_name(name: Optional[str]) -> Optional[str]:
-        if not name:
-            return None
-        slug = re.sub(r"\s+", "-", name.strip().lower())
-        slug = re.sub(r"[^a-z0-9\-._]", "", slug)
-        return slug or None
+        return _slugify_name(name)
 
     @staticmethod
-    def _extract_headline(raw_text: str, profile_name: Optional[str]) -> Optional[str]:
+    def _extract_headline(
+        raw_text: str,
+        profile_name: Optional[str],
+        extra_skip: Optional[set[str]] = None,
+    ) -> Optional[str]:
         lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
         # Drop duplicated name lines and action labels
         skip = {
@@ -214,22 +482,26 @@ class InvitationScraper(BaseScraper):
             "voir plus",
             "see more",
         }
+        if extra_skip:
+            skip |= {s.strip().lower() for s in extra_skip if s}
         candidates: list[str] = []
         for line in lines:
             low = line.lower()
+            if low in skip:
+                continue
             if profile_name and (
                 line == profile_name or line.startswith(f"{profile_name} ")
             ):
                 # Skip name + LinkedIn UI context glued on the same line
                 if line == profile_name or _UI_CONTEXT_RE.search(line):
                     continue
-            if low in skip:
-                continue
             if _SHARED_RE.search(line):
                 continue
             if _ACCEPT_RE.search(line) or _IGNORE_RE.search(line):
                 continue
             if _UI_CONTEXT_RE.search(line):
+                continue
+            if _NEWSLETTER_HINT_RE.search(line) and "•" in line:
                 continue
             candidates.append(line)
         if not candidates:
@@ -287,13 +559,19 @@ class InvitationScraper(BaseScraper):
             data_id = (await card.get_attribute("data-invitation-id") or "").lower()
             if data_id == needle:
                 return card
-            hrefs = card.locator('a[href*="/in/"], a[href*="/company/"]')
+            hrefs = card.locator(
+                'a[href*="/in/"], a[href*="/company/"], a[href*="/newsletters/"]'
+            )
             n = await hrefs.count()
             for j in range(n):
                 href = (await hrefs.nth(j).get_attribute("href") or "").lower()
-                if f"/in/{needle}" in href or f"/company/{needle}" in href:
+                if (
+                    f"/in/{needle}" in href
+                    or f"/company/{needle}" in href
+                    or f"/newsletters/{needle}" in href
+                ):
                     return card
-            # Fallback: slugified visible name
+            # Fallback: slugified visible name / classified id
             parsed = await self._parse_card(card)
             if parsed and parsed.invitation_id.lower() == needle:
                 return card

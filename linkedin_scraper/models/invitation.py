@@ -1,8 +1,16 @@
 """Pydantic model for a LinkedIn connection invitation."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from pydantic import BaseModel
+
+InvitationKind = Literal[
+    "connection",
+    "follow_person",
+    "follow_company",
+    "follow_newsletter",
+    "unknown",
+]
 
 
 class Invitation(BaseModel):
@@ -13,6 +21,12 @@ class Invitation(BaseModel):
     shared_connection_count: Optional[int] = None
     message: Optional[str] = None
     received_at: Optional[str] = None
+    invitation_kind: InvitationKind = "unknown"
+    inviter_name: Optional[str] = None
+    inviter_url: Optional[str] = None
+    target_name: Optional[str] = None
+    target_url: Optional[str] = None
+    display_text: Optional[str] = None
     raw_card_text: Optional[str] = None
 
     _DEFAULT_PUBLIC_EXCLUDE = {"raw_card_text"}

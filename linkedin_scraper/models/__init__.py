@@ -4,7 +4,7 @@ from .person import Person, Experience, Education, Contact, Accomplishment, Inte
 from .company import Company, CompanySummary, Employee
 from .job import Job
 from .post import Post
-from .invitation import Invitation
+from .invitation import Invitation, InvitationKind
 from .conversation import Conversation
 from .message import Message
 
@@ -21,6 +21,7 @@ __all__ = [
     "Job",
     "Post",
     "Invitation",
+    "InvitationKind",
     "Conversation",
     "Message",
 ]
