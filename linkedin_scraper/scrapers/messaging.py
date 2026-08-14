@@ -7,7 +7,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from playwright.async_api import Locator, Page, Response
 
@@ -21,10 +21,18 @@ logger = logging.getLogger(__name__)
 
 MESSAGING_URL = "https://www.linkedin.com/messaging/"
 THREAD_URL_TMPL = "https://www.linkedin.com/messaging/thread/{conversation_id}/"
+MESSAGING_GRAPHQL_URL = (
+    "https://www.linkedin.com/voyager/api/voyagerMessagingGraphQL/graphql"
+)
+# Observed LinkedIn query id for messengerMessagesBySyncToken (may change).
+MESSENGER_MESSAGES_QUERY_ID = (
+    "messengerMessages.5846eeb71c981f11e0134cb6626cc314"
+)
 
 _THREAD_RE = re.compile(r"/messaging/thread/([^/?#]+)/?", re.IGNORECASE)
 _UNREAD_RE = re.compile(r"(\d+)\s*(nouvelle|new)", re.IGNORECASE)
 _SEND_BUTTON_RE = re.compile(r"^(send|envoyer)$", re.IGNORECASE)
+_FSD_PROFILE_RE = re.compile(r"urn:li:fsd_profile:([A-Za-z0-9_-]+)")
 
 
 class MessagingScraper(BaseScraper):
@@ -32,6 +40,7 @@ class MessagingScraper(BaseScraper):
 
     def __init__(self, page: Page, callback: Optional[ProgressCallback] = None):
         super().__init__(page, callback or SilentCallback())
+        self._self_profile_id: Optional[str] = None
 
     async def list_recent(
         self, limit: int = 20, *, allow_click_resolve: bool = False
@@ -241,10 +250,339 @@ class MessagingScraper(BaseScraper):
                     return fallback
         return None
 
+    @staticmethod
+    def _self_profile_id_from_payloads(
+        payloads: list[dict[str, Any]],
+    ) -> Optional[str]:
+        """Extract the logged-in member's fsd_profile id from conversation payloads."""
+        for payload in payloads:
+            for element in MessagingScraper._iter_conversation_elements(payload):
+                # Prefer SELF participant urns
+                for participant in element.get("conversationParticipants") or []:
+                    if not isinstance(participant, dict):
+                        continue
+                    member = (participant.get("participantType") or {}).get("member")
+                    if not isinstance(member, dict) or member.get("distance") != "SELF":
+                        continue
+                    for key in ("hostIdentityUrn", "entityUrn", "backendUrn"):
+                        urn = participant.get(key) or ""
+                        m = _FSD_PROFILE_RE.search(urn)
+                        if m:
+                            return m.group(1)
+                    profile_url = member.get("profileUrl") or ""
+                    m = re.search(r"/in/(ACo[A-Za-z0-9_-]+)", profile_url)
+                    if m:
+                        return m.group(1)
+                # Fallback: conversation entityUrn embeds self profile id
+                for key in ("entityUrn", "backendUrn"):
+                    urn = element.get(key) or ""
+                    m = re.search(
+                        r"msg_conversation:\(urn:li:fsd_profile:([A-Za-z0-9_-]+),",
+                        urn,
+                    )
+                    if m:
+                        return m.group(1)
+        return None
+
+    @staticmethod
+    def _build_messages_graphql_url(
+        self_profile_id: str,
+        conversation_id: str,
+        sync_token: Optional[str] = None,
+        *,
+        query_id: str = MESSENGER_MESSAGES_QUERY_ID,
+    ) -> str:
+        """Build voyagerMessagingGraphQL URL for messengerMessagesBySyncToken."""
+        conversation_id = unquote(conversation_id.strip())
+        urn = (
+            f"urn:li:msg_conversation:(urn:li:fsd_profile:{self_profile_id},"
+            f"{conversation_id})"
+        )
+        # Browser encodes the URN value but leaves the `(conversationUrn:…)` wrapper.
+        urn_enc = quote(urn, safe="")
+        if sync_token:
+            variables = (
+                f"(conversationUrn:{urn_enc},syncToken:{quote(sync_token, safe='')})"
+            )
+        else:
+            variables = f"(conversationUrn:{urn_enc})"
+        return f"{MESSAGING_GRAPHQL_URL}?queryId={query_id}&variables={variables}"
+
+    @staticmethod
+    def _message_from_api_element(
+        element: dict[str, Any], conversation_id: str
+    ) -> Optional[Message]:
+        """Parse one messengerMessages GraphQL element into a Message."""
+        if not isinstance(element, dict):
+            return None
+
+        body = element.get("body") or {}
+        text = None
+        if isinstance(body, dict):
+            text = (body.get("text") or "").strip() or None
+        if not text:
+            text = (element.get("renderContentFallbackText") or "").strip() or None
+        if not text:
+            return None
+
+        actor = element.get("actor") or element.get("sender") or {}
+        member: dict[str, Any] = {}
+        if isinstance(actor, dict):
+            member = (actor.get("participantType") or {}).get("member") or {}
+            if not isinstance(member, dict):
+                member = {}
+
+        direction: MessageDirection = "unknown"
+        if member.get("distance") == "SELF":
+            direction = "outbound"
+        elif member:
+            direction = "inbound"
+
+        first = ((member.get("firstName") or {}).get("text") or "").strip()
+        last = ((member.get("lastName") or {}).get("text") or "").strip()
+        sender_name = f"{first} {last}".strip() or None
+        sender_url = member.get("profileUrl")
+
+        delivered = element.get("deliveredAt")
+        sent_at = None
+        if isinstance(delivered, (int, float)):
+            sent_at = datetime.fromtimestamp(
+                delivered / 1000.0, tz=timezone.utc
+            ).isoformat()
+
+        message_id = element.get("entityUrn") or element.get("backendUrn")
+        if isinstance(message_id, str):
+            message_id = message_id.strip() or None
+        else:
+            message_id = None
+
+        return Message(
+            conversation_id=conversation_id,
+            message_id=message_id,
+            sender_name=sender_name,
+            sender_url=sender_url,
+            direction=direction,
+            text=text,
+            sent_at=sent_at,
+            raw_event_text=json.dumps(
+                {"entityUrn": element.get("entityUrn"), "deliveredAt": delivered},
+                ensure_ascii=False,
+            ),
+        )
+
+    @staticmethod
+    def _messages_from_graphql_payload(
+        payload: dict[str, Any], conversation_id: str
+    ) -> tuple[list[Message], Optional[str]]:
+        """Return (messages, new_sync_token) from a messengerMessages payload."""
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return [], None
+
+        block = data.get("messengerMessagesBySyncToken")
+        if not isinstance(block, dict):
+            for key, value in data.items():
+                if (
+                    isinstance(key, str)
+                    and "Messages" in key
+                    and isinstance(value, dict)
+                    and "elements" in value
+                ):
+                    block = value
+                    break
+        if not isinstance(block, dict):
+            return [], None
+
+        messages: list[Message] = []
+        for element in block.get("elements") or []:
+            if isinstance(element, dict):
+                msg = MessagingScraper._message_from_api_element(
+                    element, conversation_id
+                )
+                if msg is not None:
+                    messages.append(msg)
+
+        meta = block.get("metadata") or {}
+        new_token = meta.get("newSyncToken") if isinstance(meta, dict) else None
+        if new_token is not None:
+            new_token = str(new_token)
+        return messages, new_token
+
+    async def _resolve_self_profile_id(self) -> str:
+        """Resolve fsd_profile id via messengerConversations capture on /messaging/."""
+        payloads: list[dict[str, Any]] = []
+
+        async def _on_response(response: Response) -> None:
+            try:
+                if "messengerConversations" not in response.url:
+                    return
+                if response.status != 200:
+                    return
+                data = await response.json()
+                if isinstance(data, dict):
+                    payloads.append(data)
+            except Exception as exc:
+                logger.debug(
+                    "Ignoring conversations payload while resolving self: %s", exc
+                )
+
+        self.page.on("response", _on_response)
+        try:
+            # Always reload inbox so messengerConversations GraphQL fires
+            # (no-op navigate when already on /messaging/ leaves payloads empty).
+            await self.navigate_and_wait(MESSAGING_URL)
+            await self.ensure_logged_in()
+            await self.page.wait_for_timeout(2000)
+            await self.page.evaluate(
+                """() => {
+                  const list = document.querySelector(
+                    '.msg-conversations-container__conversations-list'
+                  );
+                  if (list) list.scrollTop = Math.min(400, list.scrollHeight);
+                }"""
+            )
+            await self.page.wait_for_timeout(1500)
+        finally:
+            self.page.remove_listener("response", _on_response)
+
+        self_id = self._self_profile_id_from_payloads(payloads)
+        if not self_id:
+            raise ScrapingError(
+                "Could not resolve self fsd_profile id from messengerConversations"
+            )
+        self._self_profile_id = self_id
+        return self_id
+
+    async def _voyager_graphql_fetch(self, url: str) -> dict[str, Any]:
+        """GET a voyager GraphQL URL using the page's cookies + CSRF token."""
+        result = await self.page.evaluate(
+            """async (url) => {
+                const csrfCookie = document.cookie.split(';')
+                    .map(s => s.trim())
+                    .find(s => s.startsWith('JSESSIONID='));
+                const token = csrfCookie
+                    ? csrfCookie.split('=').slice(1).join('=').replace(/"/g, '')
+                    : '';
+                const res = await fetch(url, {
+                    credentials: 'include',
+                    headers: {
+                        'accept': 'application/graphql',
+                        'csrf-token': token,
+                        'x-restli-protocol-version': '2.0.0',
+                    },
+                });
+                const text = await res.text();
+                return { status: res.status, text };
+            }""",
+            url,
+        )
+        status = result.get("status")
+        text = result.get("text") or ""
+        if status != 200:
+            raise ScrapingError(f"voyager GraphQL HTTP {status}: {text[:200]}")
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ScrapingError(f"voyager GraphQL invalid JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise ScrapingError("voyager GraphQL response is not an object")
+        return data
+
+    async def get_messages_graphql(
+        self,
+        conversation_id: str,
+        *,
+        self_profile_id: Optional[str] = None,
+        max_pages: int = 50,
+        page_pause_ms: int = 400,
+    ) -> list[Message]:
+        """Fetch messages via messengerMessages GraphQL (no DOM bubble parsing).
+
+        Lands on ``/messaging/`` for session/CSRF, then pages with ``syncToken``
+        until no new message ids appear. Does **not** require opening the thread
+        URL for each page.
+
+        Args:
+            conversation_id: Thread id (``2-…``).
+            self_profile_id: Logged-in ``fsd_profile`` id; resolved automatically
+                if omitted.
+            max_pages: Safety cap on GraphQL pages.
+            page_pause_ms: Pause between pages.
+        """
+        if not conversation_id or not conversation_id.strip():
+            raise ScrapingError("conversation_id is required")
+        conversation_id = unquote(conversation_id.strip())
+        if max_pages < 1:
+            raise ScrapingError("max_pages must be >= 1")
+
+        logger.info(
+            "Getting messages via GraphQL conversation=%s max_pages=%s",
+            conversation_id,
+            max_pages,
+        )
+        await self.callback.on_start("MessagingGraphQL", conversation_id)
+
+        if "linkedin.com" not in (self.page.url or ""):
+            await self._open_messaging()
+            await self.ensure_logged_in()
+            await self.check_rate_limit()
+        elif "/messaging" not in (self.page.url or ""):
+            await self._open_messaging()
+            await self.ensure_logged_in()
+
+        if not self_profile_id:
+            self_profile_id = self._self_profile_id or await self._resolve_self_profile_id()
+            self._self_profile_id = self_profile_id
+        else:
+            self._self_profile_id = self_profile_id
+
+        seen: set[str] = set()
+        collected: list[Message] = []
+        sync_token: Optional[str] = None
+
+        for page_idx in range(max_pages):
+            url = self._build_messages_graphql_url(
+                self_profile_id, conversation_id, sync_token
+            )
+            payload = await self._voyager_graphql_fetch(url)
+            batch, new_token = self._messages_from_graphql_payload(
+                payload, conversation_id
+            )
+            new_count = 0
+            for msg in batch:
+                mid = msg.message_id or f"{msg.sent_at}:{msg.text}"
+                if mid in seen:
+                    continue
+                seen.add(mid)
+                collected.append(msg)
+                new_count += 1
+
+            logger.debug(
+                "GraphQL messages page %s: batch=%s new=%s total=%s",
+                page_idx,
+                len(batch),
+                new_count,
+                len(collected),
+            )
+            if new_count == 0 or not new_token or new_token == sync_token:
+                break
+            sync_token = new_token
+            if page_pause_ms > 0:
+                await self.page.wait_for_timeout(page_pause_ms)
+
+        collected.sort(key=lambda m: (m.sent_at or "", m.message_id or ""))
+        await self.callback.on_complete("MessagingGraphQL", collected)
+        logger.info(
+            "GraphQL fetched %s messages for conversation %s",
+            len(collected),
+            conversation_id,
+        )
+        return collected
+
     async def get_conversation(
         self, conversation_id: str, limit: int = 50
     ) -> list[Message]:
-        """Fetch messages for a conversation thread."""
+        """Fetch messages for a conversation thread (DOM)."""
         if not conversation_id or not conversation_id.strip():
             raise ScrapingError("conversation_id is required")
 

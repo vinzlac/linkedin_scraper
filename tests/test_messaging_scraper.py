@@ -186,3 +186,72 @@ async def test_compose_editor_locator_from_fixture():
         editor = scraper._compose_editor()
         assert await editor.count() == 1
         await browser.close()
+
+
+MESSAGES_GQL_FIXTURE = Path(__file__).parent / "fixtures" / "messenger_messages_graphql.json"
+
+
+@pytest.mark.unit
+def test_build_messages_graphql_url_encodes_urn():
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    url = MessagingScraper._build_messages_graphql_url(
+        "ACoAAAEKNzwB4E69dZJoooWDrlDaPEU8Mpaezoc",
+        "2-YjQxNTU2NjAtNzk3My00MjBmLTg5MzItODRjZDc5OTQyYWJjXzEwMA==",
+    )
+    assert "queryId=messengerMessages." in url
+    assert "variables=(conversationUrn:urn%3Ali%3Amsg_conversation%3A" in url
+    assert "%2C2-YjQxNTU2NjAtNzk3My00MjBmLTg5MzItODRjZDc5OTQyYWJjXzEwMA%3D%3D" in url
+
+
+@pytest.mark.unit
+def test_messages_from_graphql_fixture_directions():
+    import json
+
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    payload = json.loads(MESSAGES_GQL_FIXTURE.read_text(encoding="utf-8"))
+    cid = "2-NjM4Yjc2ODEtMzIzMS00OWMwLWJmOGQtYTU0NDAyMDAxYjVjXzEwMA=="
+    messages, token = MessagingScraper._messages_from_graphql_payload(payload, cid)
+    assert token
+    assert len(messages) >= 1
+    assert all(m.conversation_id == cid for m in messages)
+    assert all(m.text for m in messages)
+    assert {m.direction for m in messages} <= {"inbound", "outbound", "unknown"}
+    # At least one direction should be resolved from distance=SELF / other
+    assert any(m.direction in ("inbound", "outbound") for m in messages)
+
+
+@pytest.mark.unit
+def test_self_profile_id_from_payloads():
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    payload = {
+        "data": {
+            "messengerConversationsBySyncToken": {
+                "elements": [
+                    {
+                        "conversationUrl": "https://www.linkedin.com/messaging/thread/2-abc/",
+                        "conversationParticipants": [
+                            {
+                                "hostIdentityUrn": "urn:li:fsd_profile:ACoSelf123",
+                                "participantType": {
+                                    "member": {"distance": "SELF"}
+                                },
+                            },
+                            {
+                                "hostIdentityUrn": "urn:li:fsd_profile:ACoOther",
+                                "participantType": {
+                                    "member": {
+                                        "distance": "DISTANCE_1",
+                                        "firstName": {"text": "Ada"},
+                                    }
+                                },
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+    assert MessagingScraper._self_profile_id_from_payloads([payload]) == "ACoSelf123"
