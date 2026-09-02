@@ -9,6 +9,8 @@ InvitationKind = Literal[
     "follow_person",
     "follow_company",
     "follow_newsletter",
+    "follow_showcase_page",
+    "event_invitation",
     "unknown",
 ]
 

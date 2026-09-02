@@ -180,6 +180,72 @@ async def test_find_follow_company_card_by_target_slug():
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parse_showcase_page_kind():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.invitations import InvitationScraper
+
+    html = FIXTURE.read_text(encoding="utf-8")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        scraper = InvitationScraper(page)
+        cards = await scraper._extract_invitations(limit=10)
+        await browser.close()
+
+    nvidia = next(c for c in cards if c.invitation_id == "nvidia-ai")
+    assert nvidia.invitation_kind == "follow_showcase_page"
+    assert nvidia.target_name == "NVIDIA AI"
+    assert nvidia.target_url and "/showcase/nvidia-ai" in nvidia.target_url
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_parse_event_invitation_kind():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.invitations import InvitationScraper
+
+    html = FIXTURE.read_text(encoding="utf-8")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        scraper = InvitationScraper(page)
+        cards = await scraper._extract_invitations(limit=10)
+        await browser.close()
+
+    event = next(c for c in cards if c.invitation_id == "7123456789012345678")
+    assert event.invitation_kind == "event_invitation"
+    assert event.inviter_name == "Marie Curie"
+    assert event.target_name == "Conférence IA 2026"
+    assert event.target_url and "/events/7123456789012345678" in event.target_url
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_find_showcase_and_event_cards_by_target_slug():
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.invitations import InvitationScraper
+
+    html = FIXTURE.read_text(encoding="utf-8")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        scraper = InvitationScraper(page)
+        by_showcase = await scraper._find_card_by_id("nvidia-ai")
+        by_event = await scraper._find_card_by_id("7123456789012345678")
+        await browser.close()
+
+    assert by_showcase is not None
+    assert by_event is not None
+
+
+@pytest.mark.unit
 def test_invitation_public_dict_includes_kind_fields():
     inv = Invitation(
         invitation_id="leygacy",
