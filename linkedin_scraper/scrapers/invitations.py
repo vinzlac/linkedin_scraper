@@ -28,6 +28,13 @@ _SHARED_RE = re.compile(
 _PROFILE_RE = re.compile(r"/in/([^/?#]+)/?", re.IGNORECASE)
 _COMPANY_RE = re.compile(r"/company/([^/?#]+)/?", re.IGNORECASE)
 _NEWSLETTER_RE = re.compile(r"/newsletters/([^/?#]+)/?", re.IGNORECASE)
+# Showcase pages have their own top-level path (/showcase/{slug}/), distinct
+# from /company/{slug}/ — a card linking only to a showcase page was
+# previously invisible to entity extraction (fell through to "unknown" or was
+# skipped for lack of invitation_id).
+_SHOWCASE_RE = re.compile(r"/showcase/([^/?#]+)/?", re.IGNORECASE)
+# LinkedIn Event invitations (numeric id, no slug) — same gap as showcase.
+_EVENT_RE = re.compile(r"/events/(\d+)/?", re.IGNORECASE)
 _FOLLOW_RE = re.compile(
     r"(vous\s+a\s+invité(?:\(e\))?\s+à\s+suivre|"
     r"vous\s+invite\s+à\s+suivre|"
@@ -92,12 +99,18 @@ def classify_invitation(
     persons: list[_EntityLink],
     companies: list[_EntityLink],
     newsletters: list[_EntityLink],
+    showcases: Optional[list[_EntityLink]] = None,
+    events: Optional[list[_EntityLink]] = None,
 ) -> _ClassifiedInvitation:
     """Derive invitation subtype + inviter/target from card text and entity links."""
+    showcases = showcases or []
+    events = events or []
     display_text = _extract_display_text(raw_text)
     person = _first_named(persons)
     company = _first_named(companies)
     newsletter = _first_named(newsletters)
+    showcase = _first_named(showcases)
+    event = _first_named(events)
     text_target = _follow_target_from_text(raw_text)
 
     is_follow = bool(_FOLLOW_RE.search(raw_text) or _FOLLOW_PAGE_RE.search(raw_text))
@@ -115,6 +128,24 @@ def classify_invitation(
         )
         target_name = (target.name if target else None) or text_target
         target_url = target.url if target else None
+    elif event:
+        kind = "event_invitation"
+        target = event
+        inviter = person or event
+        invitation_id = _id_from_url(event.url) or _id_from_url(
+            person.url if person else None
+        )
+        target_name = event.name or text_target
+        target_url = event.url
+    elif showcase:
+        kind = "follow_showcase_page"
+        target = showcase
+        inviter = person or showcase
+        invitation_id = _id_from_url(showcase.url) or _id_from_url(
+            person.url if person else None
+        )
+        target_name = showcase.name or text_target
+        target_url = showcase.url
     elif company and (is_follow or not person):
         kind = "follow_company"
         inviter = person or company
@@ -248,6 +279,8 @@ def _id_from_url(url: Optional[str]) -> Optional[str]:
         _PROFILE_RE.search(path)
         or _COMPANY_RE.search(path)
         or _NEWSLETTER_RE.search(path)
+        or _SHOWCASE_RE.search(path)
+        or _EVENT_RE.search(path)
     )
     return unquote(m.group(1)) if m else None
 
@@ -372,8 +405,12 @@ class InvitationScraper(BaseScraper):
 
     async def _parse_card(self, card: Locator) -> Optional[Invitation]:
         raw_text = (await card.inner_text() or "").strip()
-        persons, companies, newsletters = await self._extract_entity_links(card)
-        classified = classify_invitation(raw_text, persons, companies, newsletters)
+        persons, companies, newsletters, showcases, events = await self._extract_entity_links(
+            card
+        )
+        classified = classify_invitation(
+            raw_text, persons, companies, newsletters, showcases, events
+        )
 
         data_id = await card.get_attribute("data-invitation-id")
         invitation_id = data_id or classified.invitation_id
@@ -415,13 +452,22 @@ class InvitationScraper(BaseScraper):
 
     async def _extract_entity_links(
         self, card: Locator
-    ) -> tuple[list[_EntityLink], list[_EntityLink], list[_EntityLink]]:
+    ) -> tuple[
+        list[_EntityLink],
+        list[_EntityLink],
+        list[_EntityLink],
+        list[_EntityLink],
+        list[_EntityLink],
+    ]:
         links = card.locator(
-            'a[href*="/in/"], a[href*="/company/"], a[href*="/newsletters/"]'
+            'a[href*="/in/"], a[href*="/company/"], a[href*="/newsletters/"], '
+            'a[href*="/showcase/"], a[href*="/events/"]'
         )
         persons: list[_EntityLink] = []
         companies: list[_EntityLink] = []
         newsletters: list[_EntityLink] = []
+        showcases: list[_EntityLink] = []
+        events: list[_EntityLink] = []
         n = await links.count()
         for i in range(n):
             link = links.nth(i)
@@ -433,11 +479,15 @@ class InvitationScraper(BaseScraper):
             path = urlparse(url).path
             if _NEWSLETTER_RE.search(path):
                 self._merge_entity(newsletters, url, name)
+            elif _EVENT_RE.search(path):
+                self._merge_entity(events, url, name)
+            elif _SHOWCASE_RE.search(path):
+                self._merge_entity(showcases, url, name)
             elif _COMPANY_RE.search(path):
                 self._merge_entity(companies, url, name)
             elif _PROFILE_RE.search(path):
                 self._merge_entity(persons, url, name)
-        return persons, companies, newsletters
+        return persons, companies, newsletters, showcases, events
 
     @staticmethod
     def _merge_entity(bucket: list[_EntityLink], url: str, name: Optional[str]) -> None:
@@ -560,7 +610,8 @@ class InvitationScraper(BaseScraper):
             if data_id == needle:
                 return card
             hrefs = card.locator(
-                'a[href*="/in/"], a[href*="/company/"], a[href*="/newsletters/"]'
+                'a[href*="/in/"], a[href*="/company/"], a[href*="/newsletters/"], '
+                'a[href*="/showcase/"], a[href*="/events/"]'
             )
             n = await hrefs.count()
             for j in range(n):
@@ -569,6 +620,8 @@ class InvitationScraper(BaseScraper):
                     f"/in/{needle}" in href
                     or f"/company/{needle}" in href
                     or f"/newsletters/{needle}" in href
+                    or f"/showcase/{needle}" in href
+                    or f"/events/{needle}" in href
                 ):
                     return card
             # Fallback: slugified visible name / classified id
