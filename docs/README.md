@@ -36,6 +36,7 @@ Incidents de scraping documentés (régressions DOM, session, MCP) :
 | Date | Incident | Fichier |
 |------|----------|---------|
 | 2026-06-25 | Feed vide — boutons Republier icône (`aria-label` only) | [post-mortem/2026-06-25-feed-repost-aria-label.md](post-mortem/2026-06-25-feed-repost-aria-label.md) |
+| 2026-09-01 | Sous-types d'invitation Showcase/Event non classifiés (jamais captés) | [post-mortem/2026-09-01-invitation-kind-showcase-event-gap.md](post-mortem/2026-09-01-invitation-kind-showcase-event-gap.md) |
 
 ## Ressources
 

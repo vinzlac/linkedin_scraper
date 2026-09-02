@@ -34,3 +34,4 @@ Chaque ADR suit le format :
 | [016](016-rate-limit-avoidance.md) | Stratégie multi-couches contre la détection et le rate limit LinkedIn | Accepted |
 | [017](017-remote-cdp-homelab-chromium.md) | Connexion CDP au Chromium partagé du homelab (k3s-homelab / OpenClaw Phase 10) | Accepted |
 | [018](018-pypi-publication.md) | Publication PyPI sous `linkedin-playwright-scraper` | Accepted |
+| [019](019-invitation-subtype-classification-showcase-event.md) | Classification par pattern d'URL pour les sous-types d'invitation (Showcase, Event) | Accepted |
