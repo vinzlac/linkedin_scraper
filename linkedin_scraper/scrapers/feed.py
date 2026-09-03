@@ -58,6 +58,45 @@ _WAIT_FOR_FEED_JS = (
 )
 
 
+# Contrôles à cliquer pour révéler les fils de commentaires. Vérifié en live le
+# 2026-09-03 : le compteur « N commentaires » est un div[role="button"] SANS
+# aria-label — l'ancien matcher, qui n'acceptait que
+# button[aria-label*="commentaire"], ne trouvait plus rien, donc `comments` et
+# `top_comment` restaient vides sauf sur les cartes dont LinkedIn pré-affiche un
+# commentaire. Un clic JS déclenche bien React (mesuré : 3 → 18 commentaires).
+#
+# Exclusions volontaires : le composeur (« Commenter », « Écrire un
+# commentaire ») ouvre une zone de saisie et non le fil ; les menus d'options
+# (« Voir plus d'options pour le commentaire de X ») contiennent aussi le mot
+# « commentaire » mais ouvrent un dropdown.
+_EXPAND_COMMENTS_JS = r"""
+(maxClicks) => {
+  var countRe = /(\d[\d\s.,]*k?)\s*(commentaires?|comments?)/i;
+  var moreRe = /^(voir|afficher|load|show)\s.*(commentaires?|comments?)/i;
+  var composerRe = /^(commenter|comment|écrire un commentaire|write a comment|add a comment)$/i;
+  var excludeRe = /option|menu|réagir|react|répondre|reply/i;
+  var ctrls = Array.from(document.querySelectorAll('button, [role="button"]'));
+  var clicked = 0;
+  for (var i = 0; i < ctrls.length && clicked < maxClicks; i++) {
+    var el = ctrls[i];
+    if (!(el.offsetParent || el.getClientRects().length)) continue;
+    var aria = (el.getAttribute("aria-label") || "").trim();
+    var lines = (el.innerText || "").split("\n").map(function (l) {
+      return l.trim();
+    }).filter(Boolean);
+    var label = lines.length ? lines[0] : "";
+    if (composerRe.test(label) || composerRe.test(aria)) continue;
+    if (excludeRe.test(aria) || excludeRe.test(label)) continue;
+    if (!(countRe.test(label) || moreRe.test(label) || countRe.test(aria) || moreRe.test(aria))) continue;
+    try {
+      el.click();
+      clicked++;
+    } catch (e) {}
+  }
+  return clicked;
+}
+"""
+
 class FeedScraper(BaseScraper):
 
     def __init__(self, page: Page, callback: Optional[ProgressCallback] = None):
@@ -1370,38 +1409,31 @@ class FeedScraper(BaseScraper):
             )
         return normalized
 
-    async def _expand_visible_comments_for_url_scrape(self) -> None:
-        """Best effort: open visible comment threads so comment links appear in DOM."""
+    async def _expand_visible_comments_for_url_scrape(self, max_clicks: int = 8) -> int:
+        """Ouvre les fils de commentaires visibles pour que leur DOM existe.
+
+        Best effort, ne lève jamais. Le plafond de clics est conservé tel quel :
+        chaque clic est une interaction UI sur une session live, et c'est ce type
+        de rafale qui avait déclenché le rate limit du 2026-07-22.
+
+        Returns:
+            Nombre de contrôles cliqués (0 s'il n'y avait rien à ouvrir).
+        """
         try:
-            buttons = self.page.locator("button[aria-label]")
-            total = min(await buttons.count(), 80)
-            opened = 0
-            for i in range(total):
-                btn = buttons.nth(i)
-                try:
-                    if not await btn.is_visible():
-                        continue
-                    label = ((await btn.get_attribute("aria-label")) or "").strip().lower()
-                    if not label:
-                        continue
-                    if "comment" not in label and "commentaire" not in label:
-                        continue
-                    # Skip "Commenter/Comment" action button (composer), keep open-thread controls.
-                    if label in {"comment", "commenter"}:
-                        continue
-                    if "écrire un commentaire" in label or "write a comment" in label:
-                        continue
-                    await btn.click(timeout=1200)
-                    opened += 1
-                    if opened >= 8:
-                        break
-                    await self.page.wait_for_timeout(120)
-                except Exception:
-                    continue
-            if opened:
-                await self.page.wait_for_timeout(300)
-        except Exception:
-            pass
+            clicked = await self.page.evaluate(_EXPAND_COMMENTS_JS, max_clicks)
+        except Exception as exc:
+            logger.debug("Expansion des commentaires ignorée : %s", exc)
+            return 0
+
+        try:
+            clicked = int(clicked or 0)
+        except (TypeError, ValueError):
+            return 0
+
+        if clicked:
+            logger.info("Fils de commentaires ouverts : %s", clicked)
+            await self.page.wait_for_timeout(1200)
+        return clicked
 
     async def _fill_missing_permalinks_from_ui(
         self,

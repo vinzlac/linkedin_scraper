@@ -655,6 +655,90 @@ class TestFeedCardActorAndCountsDom:
         assert post.reposts_count == 3
 
 
+class TestExpandVisibleCommentsDom:
+    """Ouverture des fils de commentaires dans le rendu de septembre 2026.
+
+    Vérifié en live le 2026-09-03 : le contrôle « N commentaires » est un
+    `div[role="button"]` SANS aria-label. L'ancienne implémentation ne cliquait
+    que des `button[aria-label*="commentaire"]` : elle ne trouvait plus rien, et
+    `comments` / `top_comment` ne remontaient que sur les cartes dont LinkedIn
+    pré-affiche un commentaire. Un clic JS sur ce div déclenche bien React
+    (mesuré : 3 → 18 commentaires rendus).
+    """
+
+    EXPANDABLE_CARD_HTML = """
+    <html><body>
+      <div>
+        <div>Post du fil d&rsquo;actualit&eacute;</div>
+        <div><a href="/in/someone/">Someone</a></div>
+        <div><a href="/feed/update/urn:li:activity:7500000000000000001/">2 h</a></div>
+        <div>Contenu du post de test suffisamment long pour passer les filtres.</div>
+        <div>12 r&eacute;actions</div>
+        <div id="expand" role="button" onclick="
+             var d = document.createElement('div');
+             d.setAttribute('componentkey', 'replaceableComment_urn:li:comment:(urn:li:activity:7500000000000000001,42)');
+             d.innerHTML = '<div>Bruno Martin</div><div>3 h</div><div>Commentaire r&eacute;v&eacute;l&eacute; par le clic.</div>';
+             document.getElementById('comments').appendChild(d);">3 commentaires</div>
+        <div><button>J&rsquo;aime</button></div>
+        <div><button>Commenter</button></div>
+        <div><button>Republier</button></div>
+        <div id="comments"></div>
+      </div>
+    </body></html>
+    """
+
+    @pytest.mark.asyncio
+    async def test_clicks_comment_count_control_without_aria_label(self):
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(self.EXPANDABLE_CARD_HTML)
+                scraper = FeedScraper(page)
+                opened = await scraper._expand_visible_comments_for_url_scrape()
+                rendered = await page.eval_on_selector_all(
+                    '[componentkey^="replaceableComment_"]', "els => els.length"
+                )
+            finally:
+                await browser.close()
+
+        assert opened == 1
+        assert rendered == 1
+
+    @pytest.mark.asyncio
+    async def test_does_not_click_the_comment_composer(self):
+        from playwright.async_api import async_playwright
+
+        html = """
+        <html><body>
+          <div>
+            <div><button id="composer">Commenter</button></div>
+            <div role="button">&Eacute;crire un commentaire</div>
+            <div><button>Republier</button></div>
+          </div>
+          <script>
+            window.__clicks = 0;
+            document.getElementById('composer').addEventListener('click', function(){ window.__clicks++; });
+          </script>
+        </body></html>
+        """
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                scraper = FeedScraper(page)
+                opened = await scraper._expand_visible_comments_for_url_scrape()
+                clicks = await page.evaluate("window.__clicks")
+            finally:
+                await browser.close()
+
+        assert opened == 0
+        assert clicks == 0
+
+
 # ---------------------------------------------------------------------------
 # Integration tests (require a real LinkedIn session)
 # ---------------------------------------------------------------------------
