@@ -22,6 +22,24 @@ _MAX_UI_FALLBACK_PER_CALL = 4
 
 FEED_URL = "https://www.linkedin.com/feed/"
 
+# Identifiant numérique d'un post dans un permalien LinkedIn.
+# Deux formes rencontrées :
+#   /posts/{author}_{slug}-share-7500824506219909120-mYgS/
+#   /posts/{author}_{slug}-ugcPost-7500865995637538816-ayfc/
+#   /feed/update/urn:li:activity:7500989467147542528/
+_POST_URL_SLUG_ID_RE = re.compile(r"-(?:share|ugcPost|activity)-(\d{16,})(?:-|/|$)", re.I)
+# La forme URN est explicite : pas de garde de longueur (contrairement au slug,
+# où un id court serait un faux positif sur un numéro quelconque du slug).
+_POST_URL_URN_ID_RE = re.compile(r"urn:li:(?:activity|ugcPost|share):(\d+)", re.I)
+
+# Lignes de la carte de commentaire qui ne font pas partie du texte du commentaire.
+_COMMENT_ACTION_LINES = {
+    "j'aime", "j’aime", "like", "répondre", "repondre", "reply",
+    "voir plus", "see more", "… plus", "...plus", "plus",
+    "afficher la traduction", "show translation",
+    "1 réponse", "1 reply", "modifié", "edited", "auteur", "author",
+}
+
 # Texte du menu overflow « Copier le lien » (FR/EN) — LinkedIn peut rendre un button sans role=menuitem
 _COPY_LINK_MENU_TEXT_RE = re.compile(
     r"Copier le lien vers le post|Copier le lien|Copy link to post|Copy link\b",
@@ -39,6 +57,45 @@ _WAIT_FOR_FEED_JS = (
     "})"
 )
 
+
+# Contrôles à cliquer pour révéler les fils de commentaires. Vérifié en live le
+# 2026-09-03 : le compteur « N commentaires » est un div[role="button"] SANS
+# aria-label — l'ancien matcher, qui n'acceptait que
+# button[aria-label*="commentaire"], ne trouvait plus rien, donc `comments` et
+# `top_comment` restaient vides sauf sur les cartes dont LinkedIn pré-affiche un
+# commentaire. Un clic JS déclenche bien React (mesuré : 3 → 18 commentaires).
+#
+# Exclusions volontaires : le composeur (« Commenter », « Écrire un
+# commentaire ») ouvre une zone de saisie et non le fil ; les menus d'options
+# (« Voir plus d'options pour le commentaire de X ») contiennent aussi le mot
+# « commentaire » mais ouvrent un dropdown.
+_EXPAND_COMMENTS_JS = r"""
+(maxClicks) => {
+  var countRe = /(\d[\d\s.,]*k?)\s*(commentaires?|comments?)/i;
+  var moreRe = /^(voir|afficher|load|show)\s.*(commentaires?|comments?)/i;
+  var composerRe = /^(commenter|comment|écrire un commentaire|write a comment|add a comment)$/i;
+  var excludeRe = /option|menu|réagir|react|répondre|reply/i;
+  var ctrls = Array.from(document.querySelectorAll('button, [role="button"]'));
+  var clicked = 0;
+  for (var i = 0; i < ctrls.length && clicked < maxClicks; i++) {
+    var el = ctrls[i];
+    if (!(el.offsetParent || el.getClientRects().length)) continue;
+    var aria = (el.getAttribute("aria-label") || "").trim();
+    var lines = (el.innerText || "").split("\n").map(function (l) {
+      return l.trim();
+    }).filter(Boolean);
+    var label = lines.length ? lines[0] : "";
+    if (composerRe.test(label) || composerRe.test(aria)) continue;
+    if (excludeRe.test(aria) || excludeRe.test(label)) continue;
+    if (!(countRe.test(label) || moreRe.test(label) || countRe.test(aria) || moreRe.test(aria))) continue;
+    try {
+      el.click();
+      clicked++;
+    } catch (e) {}
+  }
+  return clicked;
+}
+"""
 
 class FeedScraper(BaseScraper):
 
@@ -743,17 +800,42 @@ class FeedScraper(BaseScraper):
                 ) continue;
 
                 // ---- Detect activity post (liked/commented/reshared) ----
-                // allLines[1] = "Y a commenté ce contenu" / "Y aime ce contenu"
                 // Y = actor (network contact who triggered the feed entry)
                 // X = original author (the person who wrote the post)
+                //
+                // Deux formulations coexistent (vérifié en live le 2026-09-03) :
+                //   suffixe : « Y a republié ce contenu », « Y aime ce contenu »
+                //   préfixe : « Suivi par Y », « Recommandé par Y »
+                // La forme préfixe n'était pas reconnue : aucun acteur détecté, donc
+                // le premier bloc auteur de la carte — celui du contact réseau —
+                // sortait en author_name (BUG #3).
+                // On ne se fie plus à un index fixe non plus : LinkedIn ouvre
+                // désormais chaque carte par « Post du fil d'actualité », ce qui
+                // décalait allLines[1].
                 var actorName = "";
                 var actorUrl = "";
                 var actionTakerName = "";
-                var line1 = (allLines[1] || "");
-                var actKwPat = /\\s(a\\s+comment|a\\s+r\u00e9pondu|a\\s+republi|aime\\s|a\\s+aim|a\\s+r\u00e9agi|a\\s+partag|commented|liked|reshared|reposted|reacted)/i;
-                var actMatch = line1.match(actKwPat);
-                if (actMatch && actMatch.index > 0) {
-                    actionTakerName = line1.substring(0, actMatch.index).trim().toLowerCase();
+                var actionTakerRaw = "";
+                var actKwPat = /\\s(a\\s+comment|a\\s+r\u00e9pondu|a\\s+republi|aime\\s|aiment\\s|a\\s+aim|ont\\s+aim|ont\\s+republi|ont\\s+comment|a\\s+r\u00e9agi|a\\s+partag|commented|liked|reshared|reposted|reacted)/i;
+                var actPrefixPat = /^(?:Suivi par|Followed by|Recommand\u00e9 par|Recommended by|Aim\u00e9 par|Liked by|Republi\u00e9 par|Reposted by|Sugg\u00e9r\u00e9 par|Suggested by)\\s+(.+)$/i;
+                for (var ai2 = 0; ai2 < Math.min(4, allLines.length) && !actionTakerRaw; ai2++) {
+                    var candLine = allLines[ai2] || "";
+                    if (candLine.length > 120) continue;
+                    var prefMatch = candLine.match(actPrefixPat);
+                    if (prefMatch) {
+                        actionTakerRaw = prefMatch[1]
+                            .replace(/\\s+(et|and)\\s+\\d[\\s\\S]*$/i, "")
+                            .trim();
+                        break;
+                    }
+                    var actMatch = candLine.match(actKwPat);
+                    // index borné : au-delà, on est dans du contenu, pas dans un nom
+                    if (actMatch && actMatch.index > 0 && actMatch.index <= 60) {
+                        actionTakerRaw = candLine.substring(0, actMatch.index).trim();
+                    }
+                }
+                if (actionTakerRaw) {
+                    actionTakerName = actionTakerRaw.toLowerCase();
                     // Resolve actor's profile URL from the first /in/ link that matches their name
                     var inLinksAll = el.querySelectorAll("a[href*='/in/']");
                     for (var i = 0; i < inLinksAll.length && !actorUrl; i++) {
@@ -770,7 +852,7 @@ class FeedScraper(BaseScraper):
                             actorUrl = "https://www.linkedin.com" + m[0];
                         }
                     }
-                    if (!actorName) actorName = line1.substring(0, actMatch.index).trim();
+                    if (!actorName) actorName = actionTakerRaw;
                 }
 
                 // ---- Author (original content creator) ----
@@ -808,6 +890,20 @@ class FeedScraper(BaseScraper):
                 for (var i = 0; i < allLines.length; i++) {
                     if (startIdx < 0 && isTimeLine(allLines[i])) startIdx = i + 1;
                     if (actionWords[allLines[i]]) { endIdx = i; break; }
+                }
+
+                // Barre d'action (J'aime / Commenter / Republier / Envoyer) : frontière
+                // entre le post et ses commentaires affichés. Distincte de endIdx, qui
+                // peut tomber bien avant sur « … plus » ou « Afficher la traduction ».
+                // LinkedIn rend l'apostrophe typographique (J’aime), d'où les deux formes.
+                var actionBarWords = {
+                    "J'aime": 1, "J\u2019aime": 1, "Like": 1,
+                    "Commenter": 1, "Comment": 1,
+                    "Republier": 1, "Repost": 1, "Envoyer": 1, "Send": 1,
+                };
+                var actionBarIdx = allLines.length;
+                for (var i = 0; i < allLines.length; i++) {
+                    if (actionBarWords[allLines[i]]) { actionBarIdx = i; break; }
                 }
 
                 // Skip profile-level follow/connect buttons that appear right after the date
@@ -880,6 +976,7 @@ class FeedScraper(BaseScraper):
                 // ---- Reactions / comments ----
                 var reactionsText = "";
                 var commentsText = "";
+                var repostsText = "";
                 // Scan button aria-labels for counts — extract the leading number only
                 var btns = el.querySelectorAll("button[aria-label]");
                 for (var i = 0; i < btns.length; i++) {
@@ -895,20 +992,55 @@ class FeedScraper(BaseScraper):
                         label !== "commenter" && label !== "comment"
                     ) {
                         if (!commentsText && numMatch) commentsText = numMatch[0].trim();
+                    } else if (
+                        (label.includes("republication") || label.includes("repost") ||
+                         label.includes("partage")) &&
+                        label !== "republier" && label !== "repost" &&
+                        label !== "partager" && label !== "share"
+                    ) {
+                        if (!repostsText && numMatch) repostsText = numMatch[0].trim();
                     }
                 }
                 // Fallback: scan text lines for "NNN réactions" / "NNN commentaires"
-                if (!reactionsText || !commentsText) {
+                // Le rendu de septembre 2026 n'expose plus aucun compteur dans les
+                // aria-labels de boutons : tout passe par les lignes de texte. Deux
+                // pièges vérifiés en live : les réactions basculent en preuve sociale
+                // (« Réaction de X et N autres personnes ») dès qu'une relation a
+                // réagi, et les lignes « N réactions » situées après la barre d'action
+                // appartiennent aux commentaires affichés — les compter donnait un
+                // `reactions_count` faux et silencieux (BUG #5a).
+                if (!reactionsText || !commentsText || !repostsText) {
                     var reactLineRe = /^(\\d[\\d\\s.,]*k?)\\s*(r\\u00e9actions?|reactions?)/i;
                     var commentLineRe = /^(\\d[\\d\\s.,]*k?)\\s*(commentaires?|comments?)/i;
-                    for (var i = 0; i < allLines.length; i++) {
+                    // LinkedIn groupe souvent « X commentaires \u00b7 Y republications »
+                    // dans une m\u00eame ligne : on cherche donc le motif partout dans la ligne.
+                    var repostLineRe = /(\\d[\\d\\s.,]*k?)\\s*(republications?|reposts?|partages?)/i;
+                    var socialProofRe = /(?:et|and)\\s+(\\d[\\d\\s.,]*k?)\\s+(?:autres?\\s+personnes?|autres?|others?)/i;
+                    for (var i = 0; i < actionBarIdx; i++) {
                         if (!reactionsText) {
                             var m = allLines[i].match(reactLineRe);
                             if (m) reactionsText = m[1].trim();
                         }
+                        if (!reactionsText) {
+                            // « Réaction de X et 154 autres personnes » = 155 réactions
+                            var sp = allLines[i].match(socialProofRe);
+                            if (sp) {
+                                var rawN = sp[1].trim();
+                                if (/k/i.test(rawN)) {
+                                    reactionsText = rawN;
+                                } else {
+                                    var n = parseInt(rawN.replace(/[^0-9]/g, ""), 10);
+                                    if (!isNaN(n)) reactionsText = String(n + 1);
+                                }
+                            }
+                        }
                         if (!commentsText) {
                             var m = allLines[i].match(commentLineRe);
                             if (m) commentsText = m[1].trim();
+                        }
+                        if (!repostsText) {
+                            var m = allLines[i].match(repostLineRe);
+                            if (m) repostsText = m[1].trim();
                         }
                     }
                 }
@@ -977,7 +1109,14 @@ class FeedScraper(BaseScraper):
                         url: url
                     });
                 }
+                // Le nouveau rendu (CSS atomisé) n'expose plus les classes
+                // .comments-comment-item ni les [data-id] : chaque commentaire porte
+                // un componentkey `replaceableComment_urn:li:comment:(...)`. Sans ces
+                // deux ancres, `comments` et `top_comment` restaient vides même avec
+                // des commentaires affichés.
                 var commentSelectors = [
+                    '[componentkey^="replaceableComment_"]',
+                    '[componentkey^="commentsSectionContainer"]',
                     '.comments-comment-item',
                     '[data-id^="urn:li:comment"]',
                     '.comments-comment-item-content-body',
@@ -1013,6 +1152,55 @@ class FeedScraper(BaseScraper):
                     }
                 }
 
+                // Premier commentaire visible, quel qu'il soit (contrairement \u00e0
+                // `comments` qui ne retient que ceux porteurs d'un lien externe).
+                //
+                // Le corps du commentaire n'a plus de conteneur d\u00e9di\u00e9 dans le rendu
+                // atomis\u00e9 : on le d\u00e9limite comme pour le post lui-m\u00eame, en partant de
+                // l'horodatage (l'en-t\u00eate — nom, badge, degr\u00e9, accroche — le pr\u00e9c\u00e8de)
+                // et en s'arr\u00eatant \u00e0 la premi\u00e8re ligne d'action ou de compteur.
+                function commentBodyFromNode(node) {
+                    var bodyEl = node.querySelector(
+                        '.comments-comment-item-content-body, .update-components-text, ' +
+                        '.comments-comment-item__main-content'
+                    );
+                    if (bodyEl) {
+                        var direct = (bodyEl.innerText || "").trim();
+                        if (direct) return direct;
+                    }
+                    var cl = (node.innerText || "").split("\\n").map(function (l) {
+                        return l.trim();
+                    }).filter(Boolean);
+                    var afterTime = -1;
+                    for (var i = 0; i < cl.length && afterTime < 0; i++) {
+                        if (isTimeLine(cl[i])) afterTime = i + 1;
+                    }
+                    if (afterTime < 0) return "";
+                    var skipLines = {
+                        "Suivre": 1, "Follow": 1, "Suivi": 1, "Following": 1,
+                        "Auteur": 1, "Author": 1, "Modifi\u00e9": 1, "Edited": 1,
+                        "Se connecter": 1, "Connect": 1,
+                    };
+                    var stopRe = /^(?:\u2026\\s*plus|\\.{3}\\s*plus|Voir plus|See more|J.aime|Like|R\u00e9pondre|Reply|Commenter|Comment)$/i;
+                    var countRe = /^\\d[\\d\\s.,]*k?\\s*(?:r\u00e9actions?|reactions?|commentaires?|comments?|r\u00e9ponses?|replies?)/i;
+                    // Puces de compteur rendues en chiffre nu (« 0 », « 1 », « 13 ») :
+                    // elles suivent le corps du commentaire et le polluaient.
+                    var bareNumRe = /^\\d[\\d\\s.,]*k?$/;
+                    var parts = [];
+                    for (var i = afterTime; i < cl.length; i++) {
+                        if (skipLines[cl[i]]) continue;
+                        if (stopRe.test(cl[i]) || countRe.test(cl[i]) || bareNumRe.test(cl[i])) break;
+                        parts.push(cl[i]);
+                    }
+                    return parts.join("\\n").trim();
+                }
+
+                var topComment = "";
+                for (var tc = 0; tc < commentNodes.length && !topComment; tc++) {
+                    var rawTop = commentBodyFromNode(commentNodes[tc]);
+                    if (rawTop) topComment = rawTop.slice(0, 2000);
+                }
+
                 if (!permalinkUrl) {
                     permalinkUrl = extractPermalinkFromContainer(el);
                 }
@@ -1032,7 +1220,9 @@ class FeedScraper(BaseScraper):
                     content: content,
                     reactionsText: reactionsText,
                     commentsText: commentsText,
+                    repostsText: repostsText,
                     comments: comments,
+                    topComment: topComment,
                     images: images,
                     videoUrl: videoUrl,
                     externalUrl: externalUrl,
@@ -1049,6 +1239,17 @@ class FeedScraper(BaseScraper):
             permalink = data.get("permalinkUrl") or None
             permalink_candidates = data.get("permalinkCandidates", []) or []
             linkedin_url = self._finalize_linkedin_url(permalink, urn, permalink_candidates)
+
+            # Ne jamais exposer un compkey comme `urn` : dès qu'un permalien a
+            # été résolu (DOM, menu overflow ou copy-link), il porte l'identifiant
+            # canonique du post. Sans cette normalisation, la branche copy-link
+            # renvoyait une URL correcte et un urn éphémère — doublons en base à
+            # chaque scrape et actions like/repost impossibles en aval.
+            feed_compkey = urn if str(urn or "").startswith("urn:li:compkey:") else None
+            if not str(urn or "").startswith("urn:li:activity:"):
+                canonical_urn = self._canonical_activity_urn_from_url(linkedin_url)
+                if canonical_urn:
+                    urn = canonical_urn
 
             external_url = data.get("externalUrl") or None
             if external_url:
@@ -1085,6 +1286,8 @@ class FeedScraper(BaseScraper):
             post = Post(
                 linkedin_url=linkedin_url,
                 urn=urn,
+                feed_compkey=feed_compkey,
+                top_comment=self._clean_comment_text(data.get("topComment")),
                 identifier_candidates=data.get("identifierCandidates", []),
                 permalink_candidates=permalink_candidates,
                 component_keys=data.get("componentKeys", []),
@@ -1206,38 +1409,31 @@ class FeedScraper(BaseScraper):
             )
         return normalized
 
-    async def _expand_visible_comments_for_url_scrape(self) -> None:
-        """Best effort: open visible comment threads so comment links appear in DOM."""
+    async def _expand_visible_comments_for_url_scrape(self, max_clicks: int = 8) -> int:
+        """Ouvre les fils de commentaires visibles pour que leur DOM existe.
+
+        Best effort, ne lève jamais. Le plafond de clics est conservé tel quel :
+        chaque clic est une interaction UI sur une session live, et c'est ce type
+        de rafale qui avait déclenché le rate limit du 2026-07-22.
+
+        Returns:
+            Nombre de contrôles cliqués (0 s'il n'y avait rien à ouvrir).
+        """
         try:
-            buttons = self.page.locator("button[aria-label]")
-            total = min(await buttons.count(), 80)
-            opened = 0
-            for i in range(total):
-                btn = buttons.nth(i)
-                try:
-                    if not await btn.is_visible():
-                        continue
-                    label = ((await btn.get_attribute("aria-label")) or "").strip().lower()
-                    if not label:
-                        continue
-                    if "comment" not in label and "commentaire" not in label:
-                        continue
-                    # Skip "Commenter/Comment" action button (composer), keep open-thread controls.
-                    if label in {"comment", "commenter"}:
-                        continue
-                    if "écrire un commentaire" in label or "write a comment" in label:
-                        continue
-                    await btn.click(timeout=1200)
-                    opened += 1
-                    if opened >= 8:
-                        break
-                    await self.page.wait_for_timeout(120)
-                except Exception:
-                    continue
-            if opened:
-                await self.page.wait_for_timeout(300)
-        except Exception:
-            pass
+            clicked = await self.page.evaluate(_EXPAND_COMMENTS_JS, max_clicks)
+        except Exception as exc:
+            logger.debug("Expansion des commentaires ignorée : %s", exc)
+            return 0
+
+        try:
+            clicked = int(clicked or 0)
+        except (TypeError, ValueError):
+            return 0
+
+        if clicked:
+            logger.info("Fils de commentaires ouverts : %s", clicked)
+            await self.page.wait_for_timeout(1200)
+        return clicked
 
     async def _fill_missing_permalinks_from_ui(
         self,
@@ -1676,6 +1872,46 @@ class FeedScraper(BaseScraper):
         out = FeedScraper._normalize_clipboard_post_url(url)
         logger.info("permalink_fallback [%s]: copy_link_clipboard ok url=%s", label, out[:90])
         return out, ""
+
+    @staticmethod
+    def _canonical_activity_urn_from_url(url: Optional[str]) -> Optional[str]:
+        """`urn:li:activity:<id>` déduit d'un permalien de post.
+
+        Sert à ne jamais exposer un `urn:li:compkey:` comme identifiant de post :
+        le compkey est une clé de carte de feed, éphémère et dépendante de la
+        session, donc inutilisable comme clé d'unicité en base ou en entrée de
+        `like_post` / `repost_post`.
+
+        Le id numérique porté par un slug `-share-` / `-ugcPost-` est celui de la
+        share/ugcPost sous-jacente. On l'expose sous forme `activity` (c'est la
+        forme attendue en aval et l'identifiant de déduplication), mais il ne
+        faut pas pour autant reconstruire `/feed/update/urn:li:activity:<id>/` à
+        partir de là : cette URL peut tomber sur « Post introuvable » alors que le
+        permalien d'origine se charge très bien. D'où `linkedin_url` inchangé.
+        """
+        if not url:
+            return None
+        match = _POST_URL_URN_ID_RE.search(url) or _POST_URL_SLUG_ID_RE.search(url)
+        if not match:
+            return None
+        return f"urn:li:activity:{match.group(1)}"
+
+    @staticmethod
+    def _clean_comment_text(raw: Optional[str]) -> Optional[str]:
+        """Texte d'un commentaire sans les lignes d'action (J'aime, Répondre, date)."""
+        if not raw:
+            return None
+        kept: List[str] = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.lower() in _COMMENT_ACTION_LINES:
+                continue
+            if re.fullmatch(r"\d+\s*(j|h|d|w|sem\.?|min|mois|an[s]?|y)", stripped, re.I):
+                continue
+            kept.append(stripped)
+        return "\n".join(kept)[:1000] or None
 
     @staticmethod
     def _is_company_posts_feed_listing(url: str) -> bool:

@@ -5,6 +5,10 @@ from pydantic import BaseModel, Field
 class Post(BaseModel):
     linkedin_url: Optional[str] = None
     urn: Optional[str] = None
+    # Clé de carte de feed (urn:li:compkey:…) quand LinkedIn n'expose que
+    # celle-ci dans le DOM. Éphémère et dépendante du rendu : conservée pour
+    # le debug uniquement, `urn` porte l'identifiant canonique.
+    feed_compkey: Optional[str] = None
     author_name: Optional[str] = None
     author_url: Optional[str] = None
     # For activity posts ("Y a liké/commenté/republié ce contenu de X"):
@@ -19,7 +23,11 @@ class Post(BaseModel):
     image_urls: List[str] = Field(default_factory=list)
     video_url: Optional[str] = None
     article_url: Optional[str] = None
+    # `comments` ne contient que les commentaires porteurs d'un lien externe
+    # (alimente le pipeline d'extraction de liens). `top_comment` est le texte
+    # du premier commentaire visible, sans filtre.
     comments: List[Dict[str, Any]] = Field(default_factory=list)
+    top_comment: Optional[str] = None
     # Extra debug/trace fields for difficult feed cards (compkey, repost wrappers, A/B layouts)
     identifier_candidates: List[str] = Field(default_factory=list)
     permalink_candidates: List[str] = Field(default_factory=list)
