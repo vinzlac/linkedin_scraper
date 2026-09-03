@@ -236,7 +236,10 @@ class TestFeedScraperUnit:
 
         posts = await scraper._extract_posts_from_feed()
         assert len(posts) == 1
-        assert posts[0].urn == "urn:li:compkey:expandedSomeComponentKey"
+        # L'URL du DOM porte l'activity URN : il devient l'identifiant canonique,
+        # le compkey (éphémère) est conservé pour le debug uniquement.
+        assert posts[0].urn == "urn:li:activity:777888999"
+        assert posts[0].feed_compkey == "urn:li:compkey:expandedSomeComponentKey"
         assert (
             posts[0].linkedin_url
             == "https://www.linkedin.com/feed/update/urn:li:activity:777888999/"
@@ -291,6 +294,139 @@ class TestFeedScraperUnit:
         assert len(posts) == 1
 
 
+    # --- BUG #1 (2026-09-03) : urn compkey exposé au lieu de l'activity URN ---
+
+    def test_canonical_activity_urn_from_share_slug(self):
+        scraper = self._make_scraper()
+        url = (
+            "https://www.linkedin.com/posts/thierry-templier-7ba726_mon-code-"
+            "d%C3%A9viait-lentement-et-aucun-de-share-7500824506219909120-mYgS/"
+        )
+        assert (
+            scraper._canonical_activity_urn_from_url(url)
+            == "urn:li:activity:7500824506219909120"
+        )
+
+    def test_canonical_activity_urn_from_ugcpost_slug(self):
+        scraper = self._make_scraper()
+        url = (
+            "https://www.linkedin.com/posts/akshay-pachaar_ai-agents-"
+            "ugcPost-7500865995637538816-ayfc/"
+        )
+        assert (
+            scraper._canonical_activity_urn_from_url(url)
+            == "urn:li:activity:7500865995637538816"
+        )
+
+    def test_canonical_activity_urn_from_feed_update_url(self):
+        scraper = self._make_scraper()
+        url = "https://www.linkedin.com/feed/update/urn:li:activity:7500989467147542528/"
+        assert (
+            scraper._canonical_activity_urn_from_url(url)
+            == "urn:li:activity:7500989467147542528"
+        )
+
+    def test_canonical_activity_urn_returns_none_for_non_post_urls(self):
+        scraper = self._make_scraper()
+        assert scraper._canonical_activity_urn_from_url("") is None
+        assert scraper._canonical_activity_urn_from_url(None) is None
+        assert scraper._canonical_activity_urn_from_url(
+            "https://www.linkedin.com/in/someone/"
+        ) is None
+        # Slug id too short to be an activity id
+        assert scraper._canonical_activity_urn_from_url(
+            "https://www.linkedin.com/posts/someone_x-share-1234-abcd/"
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_extract_posts_normalizes_compkey_urn_from_copy_link_permalink(self):
+        """BUG #1 : la branche copy-link résolvait l'URL mais laissait urn=compkey.
+
+        Le compkey est une clé de carte de feed, éphémère : l'utiliser comme clé
+        d'unicité en base crée un doublon à chaque scrape du même post.
+        """
+        scraper = self._make_scraper()
+        compkey = "urn:li:compkey:Lw7YuVgrCpRzKyza7-4l0u-sEsDCcoEn6hQg1beb8XY"
+        scraper.page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "urn": compkey,
+                    "permalinkUrl": (
+                        "https://www.linkedin.com/posts/thierry-templier-7ba726_mon-code-"
+                        "share-7500824506219909120-mYgS/"
+                    ),
+                    "uiPermalinkFallbackStatus": "resolved_via_copy_link_clipboard",
+                    "authorName": "Thierry Templier",
+                    "content": "Contenu suffisamment long pour passer le filtre de contenu.",
+                    "publishedAt": "7 h",
+                    "images": [],
+                }
+            ]
+        )
+
+        posts = await scraper._extract_posts_from_feed()
+
+        assert posts[0].urn == "urn:li:activity:7500824506219909120"
+        assert posts[0].feed_compkey == compkey
+        # linkedin_url reste le permalien /posts/ qui fonctionne : le id du slug
+        # est un share/ugcPost id, /feed/update/urn:li:activity:<id>/ peut 404.
+        assert "/posts/" in posts[0].linkedin_url
+
+    @pytest.mark.asyncio
+    async def test_extract_posts_keeps_compkey_urn_when_no_permalink_resolved(self):
+        scraper = self._make_scraper()
+        compkey = "urn:li:compkey:expandedSomeComponentKey"
+        scraper.page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "urn": compkey,
+                    "authorName": "Camille",
+                    "content": "Post dont aucun permalien n'a pu être résolu, texte long.",
+                    "publishedAt": "1 j",
+                    "images": [],
+                }
+            ]
+        )
+
+        posts = await scraper._extract_posts_from_feed()
+
+        assert posts[0].urn == compkey
+        assert posts[0].feed_compkey == compkey
+        assert posts[0].linkedin_url is None
+
+    # --- BUG #4 (2026-09-03) : top_comment, champ séparé de comments ---
+
+    @pytest.mark.asyncio
+    async def test_extract_posts_exposes_top_comment(self):
+        scraper = self._make_scraper()
+        scraper.page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "urn": "urn:li:activity:123456",
+                    "authorName": "Alice",
+                    "content": "Contenu du post de test suffisamment long pour le filtre.",
+                    "publishedAt": "2h",
+                    "commentsText": "9",
+                    "topComment": "Excellent retour d'expérience, merci !\nJ'aime\nRépondre",
+                    "comments": [],
+                    "images": [],
+                }
+            ]
+        )
+
+        posts = await scraper._extract_posts_from_feed()
+
+        assert posts[0].top_comment == "Excellent retour d'expérience, merci !"
+        assert posts[0].comments == []
+
+    def test_clean_comment_text_strips_action_lines(self):
+        scraper = self._make_scraper()
+        raw = "Bruno Martin\n• 2e\nSuper post\nJ'aime\nRépondre\n2 j"
+        assert scraper._clean_comment_text(raw) == "Bruno Martin\n• 2e\nSuper post"
+        assert scraper._clean_comment_text("") is None
+        assert scraper._clean_comment_text("J'aime\nRépondre") is None
+
+
 class TestExtractAuthorFromPostCardDom:
     """Exercises the real DOM-scraping JS against a headless page.
 
@@ -337,6 +473,67 @@ class TestExtractAuthorFromPostCardDom:
         assert result["name"] == "Pierre Evrard"
         assert result["url"] == "https://www.linkedin.com/in/pierre-evrard-dashboard"
         assert result["source"] == "degree_suffix_anchor"
+
+
+class TestFeedCardCountsAndCommentsDom:
+    """Exercises the real feed-card JS against a headless page.
+
+    Regression coverage for the 2026-09-03 report:
+    - BUG #5b : `reposts_count` était systématiquement `null` (le JS ne
+      produisait jamais `repostsText`, que le Python lisait déjà).
+    - BUG #4 : `comments` ne contient que les commentaires porteurs d'un lien
+      externe (par design, pour le pipeline liens) — d'où `top_comment`,
+      alimenté par le premier commentaire visible quel qu'il soit.
+    """
+
+    FEED_CARD_HTML = """
+    <html><body>
+      <div data-urn="urn:li:activity:7500930546110382080">
+        <a href="/in/alexxubyte/"><span aria-hidden="true"></span>Alex Xu</a>
+        <span>&bull; 1er</span>
+        <a href="/feed/update/urn:li:activity:7500930546110382080/">2 h</a>
+        <div>9 Distributed Systems Patterns You Should Know, un contenu de test
+        suffisamment long pour passer les filtres du scraper.</div>
+        <button aria-label="1457 r&eacute;actions">1457</button>
+        <button aria-label="52 commentaires">52</button>
+        <button aria-label="12 republications">12</button>
+        <button>J'aime</button>
+        <button>Commenter</button>
+        <button>Republier</button>
+        <div class="comments-comment-item">
+          <span class="comments-post-meta__name-text">Bruno Martin</span>
+          <div class="comments-comment-item-content-body">
+            Le pattern CQRS m&eacute;riterait une mention.
+          </div>
+          <button>J'aime</button>
+          <button>R&eacute;pondre</button>
+        </div>
+      </div>
+    </body></html>
+    """
+
+    @pytest.mark.asyncio
+    async def test_extracts_reposts_count_and_top_comment(self):
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(self.FEED_CARD_HTML)
+                scraper = FeedScraper(page)
+                posts = await scraper._extract_posts_from_feed()
+            finally:
+                await browser.close()
+
+        assert len(posts) == 1
+        post = posts[0]
+        assert post.urn == "urn:li:activity:7500930546110382080"
+        assert post.reactions_count == 1457
+        assert post.comments_count == 52
+        assert post.reposts_count == 12
+        assert post.top_comment is not None
+        assert "CQRS" in post.top_comment
 
 
 # ---------------------------------------------------------------------------

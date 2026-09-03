@@ -22,6 +22,24 @@ _MAX_UI_FALLBACK_PER_CALL = 4
 
 FEED_URL = "https://www.linkedin.com/feed/"
 
+# Identifiant numérique d'un post dans un permalien LinkedIn.
+# Deux formes rencontrées :
+#   /posts/{author}_{slug}-share-7500824506219909120-mYgS/
+#   /posts/{author}_{slug}-ugcPost-7500865995637538816-ayfc/
+#   /feed/update/urn:li:activity:7500989467147542528/
+_POST_URL_SLUG_ID_RE = re.compile(r"-(?:share|ugcPost|activity)-(\d{16,})(?:-|/|$)", re.I)
+# La forme URN est explicite : pas de garde de longueur (contrairement au slug,
+# où un id court serait un faux positif sur un numéro quelconque du slug).
+_POST_URL_URN_ID_RE = re.compile(r"urn:li:(?:activity|ugcPost|share):(\d+)", re.I)
+
+# Lignes de la carte de commentaire qui ne font pas partie du texte du commentaire.
+_COMMENT_ACTION_LINES = {
+    "j'aime", "j’aime", "like", "répondre", "repondre", "reply",
+    "voir plus", "see more", "… plus", "...plus", "plus",
+    "afficher la traduction", "show translation",
+    "1 réponse", "1 reply", "modifié", "edited", "auteur", "author",
+}
+
 # Texte du menu overflow « Copier le lien » (FR/EN) — LinkedIn peut rendre un button sans role=menuitem
 _COPY_LINK_MENU_TEXT_RE = re.compile(
     r"Copier le lien vers le post|Copier le lien|Copy link to post|Copy link\b",
@@ -880,6 +898,7 @@ class FeedScraper(BaseScraper):
                 // ---- Reactions / comments ----
                 var reactionsText = "";
                 var commentsText = "";
+                var repostsText = "";
                 // Scan button aria-labels for counts — extract the leading number only
                 var btns = el.querySelectorAll("button[aria-label]");
                 for (var i = 0; i < btns.length; i++) {
@@ -895,12 +914,22 @@ class FeedScraper(BaseScraper):
                         label !== "commenter" && label !== "comment"
                     ) {
                         if (!commentsText && numMatch) commentsText = numMatch[0].trim();
+                    } else if (
+                        (label.includes("republication") || label.includes("repost") ||
+                         label.includes("partage")) &&
+                        label !== "republier" && label !== "repost" &&
+                        label !== "partager" && label !== "share"
+                    ) {
+                        if (!repostsText && numMatch) repostsText = numMatch[0].trim();
                     }
                 }
                 // Fallback: scan text lines for "NNN réactions" / "NNN commentaires"
-                if (!reactionsText || !commentsText) {
+                if (!reactionsText || !commentsText || !repostsText) {
                     var reactLineRe = /^(\\d[\\d\\s.,]*k?)\\s*(r\\u00e9actions?|reactions?)/i;
                     var commentLineRe = /^(\\d[\\d\\s.,]*k?)\\s*(commentaires?|comments?)/i;
+                    // LinkedIn groupe souvent « X commentaires \u00b7 Y republications »
+                    // dans une m\u00eame ligne : on cherche donc le motif partout dans la ligne.
+                    var repostLineRe = /(\\d[\\d\\s.,]*k?)\\s*(republications?|reposts?|partages?)/i;
                     for (var i = 0; i < allLines.length; i++) {
                         if (!reactionsText) {
                             var m = allLines[i].match(reactLineRe);
@@ -909,6 +938,10 @@ class FeedScraper(BaseScraper):
                         if (!commentsText) {
                             var m = allLines[i].match(commentLineRe);
                             if (m) commentsText = m[1].trim();
+                        }
+                        if (!repostsText) {
+                            var m = allLines[i].match(repostLineRe);
+                            if (m) repostsText = m[1].trim();
                         }
                     }
                 }
@@ -1013,6 +1046,18 @@ class FeedScraper(BaseScraper):
                     }
                 }
 
+                // Premier commentaire visible, quel qu'il soit (contrairement \u00e0
+                // `comments` qui ne retient que ceux porteurs d'un lien externe).
+                var topComment = "";
+                for (var tc = 0; tc < commentNodes.length && !topComment; tc++) {
+                    var bodyEl = commentNodes[tc].querySelector(
+                        '.comments-comment-item-content-body, .update-components-text, ' +
+                        '.comments-comment-item__main-content'
+                    );
+                    var rawTop = (((bodyEl || commentNodes[tc]).innerText) || "").trim();
+                    if (rawTop) topComment = rawTop.slice(0, 2000);
+                }
+
                 if (!permalinkUrl) {
                     permalinkUrl = extractPermalinkFromContainer(el);
                 }
@@ -1032,7 +1077,9 @@ class FeedScraper(BaseScraper):
                     content: content,
                     reactionsText: reactionsText,
                     commentsText: commentsText,
+                    repostsText: repostsText,
                     comments: comments,
+                    topComment: topComment,
                     images: images,
                     videoUrl: videoUrl,
                     externalUrl: externalUrl,
@@ -1049,6 +1096,17 @@ class FeedScraper(BaseScraper):
             permalink = data.get("permalinkUrl") or None
             permalink_candidates = data.get("permalinkCandidates", []) or []
             linkedin_url = self._finalize_linkedin_url(permalink, urn, permalink_candidates)
+
+            # Ne jamais exposer un compkey comme `urn` : dès qu'un permalien a
+            # été résolu (DOM, menu overflow ou copy-link), il porte l'identifiant
+            # canonique du post. Sans cette normalisation, la branche copy-link
+            # renvoyait une URL correcte et un urn éphémère — doublons en base à
+            # chaque scrape et actions like/repost impossibles en aval.
+            feed_compkey = urn if str(urn or "").startswith("urn:li:compkey:") else None
+            if not str(urn or "").startswith("urn:li:activity:"):
+                canonical_urn = self._canonical_activity_urn_from_url(linkedin_url)
+                if canonical_urn:
+                    urn = canonical_urn
 
             external_url = data.get("externalUrl") or None
             if external_url:
@@ -1085,6 +1143,8 @@ class FeedScraper(BaseScraper):
             post = Post(
                 linkedin_url=linkedin_url,
                 urn=urn,
+                feed_compkey=feed_compkey,
+                top_comment=self._clean_comment_text(data.get("topComment")),
                 identifier_candidates=data.get("identifierCandidates", []),
                 permalink_candidates=permalink_candidates,
                 component_keys=data.get("componentKeys", []),
@@ -1676,6 +1736,46 @@ class FeedScraper(BaseScraper):
         out = FeedScraper._normalize_clipboard_post_url(url)
         logger.info("permalink_fallback [%s]: copy_link_clipboard ok url=%s", label, out[:90])
         return out, ""
+
+    @staticmethod
+    def _canonical_activity_urn_from_url(url: Optional[str]) -> Optional[str]:
+        """`urn:li:activity:<id>` déduit d'un permalien de post.
+
+        Sert à ne jamais exposer un `urn:li:compkey:` comme identifiant de post :
+        le compkey est une clé de carte de feed, éphémère et dépendante de la
+        session, donc inutilisable comme clé d'unicité en base ou en entrée de
+        `like_post` / `repost_post`.
+
+        Le id numérique porté par un slug `-share-` / `-ugcPost-` est celui de la
+        share/ugcPost sous-jacente. On l'expose sous forme `activity` (c'est la
+        forme attendue en aval et l'identifiant de déduplication), mais il ne
+        faut pas pour autant reconstruire `/feed/update/urn:li:activity:<id>/` à
+        partir de là : cette URL peut tomber sur « Post introuvable » alors que le
+        permalien d'origine se charge très bien. D'où `linkedin_url` inchangé.
+        """
+        if not url:
+            return None
+        match = _POST_URL_URN_ID_RE.search(url) or _POST_URL_SLUG_ID_RE.search(url)
+        if not match:
+            return None
+        return f"urn:li:activity:{match.group(1)}"
+
+    @staticmethod
+    def _clean_comment_text(raw: Optional[str]) -> Optional[str]:
+        """Texte d'un commentaire sans les lignes d'action (J'aime, Répondre, date)."""
+        if not raw:
+            return None
+        kept: List[str] = []
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.lower() in _COMMENT_ACTION_LINES:
+                continue
+            if re.fullmatch(r"\d+\s*(j|h|d|w|sem\.?|min|mois|an[s]?|y)", stripped, re.I):
+                continue
+            kept.append(stripped)
+        return "\n".join(kept)[:1000] or None
 
     @staticmethod
     def _is_company_posts_feed_listing(url: str) -> bool:
