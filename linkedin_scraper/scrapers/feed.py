@@ -761,17 +761,42 @@ class FeedScraper(BaseScraper):
                 ) continue;
 
                 // ---- Detect activity post (liked/commented/reshared) ----
-                // allLines[1] = "Y a commenté ce contenu" / "Y aime ce contenu"
                 // Y = actor (network contact who triggered the feed entry)
                 // X = original author (the person who wrote the post)
+                //
+                // Deux formulations coexistent (vérifié en live le 2026-09-03) :
+                //   suffixe : « Y a republié ce contenu », « Y aime ce contenu »
+                //   préfixe : « Suivi par Y », « Recommandé par Y »
+                // La forme préfixe n'était pas reconnue : aucun acteur détecté, donc
+                // le premier bloc auteur de la carte — celui du contact réseau —
+                // sortait en author_name (BUG #3).
+                // On ne se fie plus à un index fixe non plus : LinkedIn ouvre
+                // désormais chaque carte par « Post du fil d'actualité », ce qui
+                // décalait allLines[1].
                 var actorName = "";
                 var actorUrl = "";
                 var actionTakerName = "";
-                var line1 = (allLines[1] || "");
-                var actKwPat = /\\s(a\\s+comment|a\\s+r\u00e9pondu|a\\s+republi|aime\\s|a\\s+aim|a\\s+r\u00e9agi|a\\s+partag|commented|liked|reshared|reposted|reacted)/i;
-                var actMatch = line1.match(actKwPat);
-                if (actMatch && actMatch.index > 0) {
-                    actionTakerName = line1.substring(0, actMatch.index).trim().toLowerCase();
+                var actionTakerRaw = "";
+                var actKwPat = /\\s(a\\s+comment|a\\s+r\u00e9pondu|a\\s+republi|aime\\s|aiment\\s|a\\s+aim|ont\\s+aim|ont\\s+republi|ont\\s+comment|a\\s+r\u00e9agi|a\\s+partag|commented|liked|reshared|reposted|reacted)/i;
+                var actPrefixPat = /^(?:Suivi par|Followed by|Recommand\u00e9 par|Recommended by|Aim\u00e9 par|Liked by|Republi\u00e9 par|Reposted by|Sugg\u00e9r\u00e9 par|Suggested by)\\s+(.+)$/i;
+                for (var ai2 = 0; ai2 < Math.min(4, allLines.length) && !actionTakerRaw; ai2++) {
+                    var candLine = allLines[ai2] || "";
+                    if (candLine.length > 120) continue;
+                    var prefMatch = candLine.match(actPrefixPat);
+                    if (prefMatch) {
+                        actionTakerRaw = prefMatch[1]
+                            .replace(/\\s+(et|and)\\s+\\d[\\s\\S]*$/i, "")
+                            .trim();
+                        break;
+                    }
+                    var actMatch = candLine.match(actKwPat);
+                    // index borné : au-delà, on est dans du contenu, pas dans un nom
+                    if (actMatch && actMatch.index > 0 && actMatch.index <= 60) {
+                        actionTakerRaw = candLine.substring(0, actMatch.index).trim();
+                    }
+                }
+                if (actionTakerRaw) {
+                    actionTakerName = actionTakerRaw.toLowerCase();
                     // Resolve actor's profile URL from the first /in/ link that matches their name
                     var inLinksAll = el.querySelectorAll("a[href*='/in/']");
                     for (var i = 0; i < inLinksAll.length && !actorUrl; i++) {
@@ -788,7 +813,7 @@ class FeedScraper(BaseScraper):
                             actorUrl = "https://www.linkedin.com" + m[0];
                         }
                     }
-                    if (!actorName) actorName = line1.substring(0, actMatch.index).trim();
+                    if (!actorName) actorName = actionTakerRaw;
                 }
 
                 // ---- Author (original content creator) ----
@@ -826,6 +851,20 @@ class FeedScraper(BaseScraper):
                 for (var i = 0; i < allLines.length; i++) {
                     if (startIdx < 0 && isTimeLine(allLines[i])) startIdx = i + 1;
                     if (actionWords[allLines[i]]) { endIdx = i; break; }
+                }
+
+                // Barre d'action (J'aime / Commenter / Republier / Envoyer) : frontière
+                // entre le post et ses commentaires affichés. Distincte de endIdx, qui
+                // peut tomber bien avant sur « … plus » ou « Afficher la traduction ».
+                // LinkedIn rend l'apostrophe typographique (J’aime), d'où les deux formes.
+                var actionBarWords = {
+                    "J'aime": 1, "J\u2019aime": 1, "Like": 1,
+                    "Commenter": 1, "Comment": 1,
+                    "Republier": 1, "Repost": 1, "Envoyer": 1, "Send": 1,
+                };
+                var actionBarIdx = allLines.length;
+                for (var i = 0; i < allLines.length; i++) {
+                    if (actionBarWords[allLines[i]]) { actionBarIdx = i; break; }
                 }
 
                 // Skip profile-level follow/connect buttons that appear right after the date
@@ -924,16 +963,37 @@ class FeedScraper(BaseScraper):
                     }
                 }
                 // Fallback: scan text lines for "NNN réactions" / "NNN commentaires"
+                // Le rendu de septembre 2026 n'expose plus aucun compteur dans les
+                // aria-labels de boutons : tout passe par les lignes de texte. Deux
+                // pièges vérifiés en live : les réactions basculent en preuve sociale
+                // (« Réaction de X et N autres personnes ») dès qu'une relation a
+                // réagi, et les lignes « N réactions » situées après la barre d'action
+                // appartiennent aux commentaires affichés — les compter donnait un
+                // `reactions_count` faux et silencieux (BUG #5a).
                 if (!reactionsText || !commentsText || !repostsText) {
                     var reactLineRe = /^(\\d[\\d\\s.,]*k?)\\s*(r\\u00e9actions?|reactions?)/i;
                     var commentLineRe = /^(\\d[\\d\\s.,]*k?)\\s*(commentaires?|comments?)/i;
                     // LinkedIn groupe souvent « X commentaires \u00b7 Y republications »
                     // dans une m\u00eame ligne : on cherche donc le motif partout dans la ligne.
                     var repostLineRe = /(\\d[\\d\\s.,]*k?)\\s*(republications?|reposts?|partages?)/i;
-                    for (var i = 0; i < allLines.length; i++) {
+                    var socialProofRe = /(?:et|and)\\s+(\\d[\\d\\s.,]*k?)\\s+(?:autres?\\s+personnes?|autres?|others?)/i;
+                    for (var i = 0; i < actionBarIdx; i++) {
                         if (!reactionsText) {
                             var m = allLines[i].match(reactLineRe);
                             if (m) reactionsText = m[1].trim();
+                        }
+                        if (!reactionsText) {
+                            // « Réaction de X et 154 autres personnes » = 155 réactions
+                            var sp = allLines[i].match(socialProofRe);
+                            if (sp) {
+                                var rawN = sp[1].trim();
+                                if (/k/i.test(rawN)) {
+                                    reactionsText = rawN;
+                                } else {
+                                    var n = parseInt(rawN.replace(/[^0-9]/g, ""), 10);
+                                    if (!isNaN(n)) reactionsText = String(n + 1);
+                                }
+                            }
                         }
                         if (!commentsText) {
                             var m = allLines[i].match(commentLineRe);
@@ -1010,7 +1070,14 @@ class FeedScraper(BaseScraper):
                         url: url
                     });
                 }
+                // Le nouveau rendu (CSS atomisé) n'expose plus les classes
+                // .comments-comment-item ni les [data-id] : chaque commentaire porte
+                // un componentkey `replaceableComment_urn:li:comment:(...)`. Sans ces
+                // deux ancres, `comments` et `top_comment` restaient vides même avec
+                // des commentaires affichés.
                 var commentSelectors = [
+                    '[componentkey^="replaceableComment_"]',
+                    '[componentkey^="commentsSectionContainer"]',
                     '.comments-comment-item',
                     '[data-id^="urn:li:comment"]',
                     '.comments-comment-item-content-body',
@@ -1048,13 +1115,50 @@ class FeedScraper(BaseScraper):
 
                 // Premier commentaire visible, quel qu'il soit (contrairement \u00e0
                 // `comments` qui ne retient que ceux porteurs d'un lien externe).
-                var topComment = "";
-                for (var tc = 0; tc < commentNodes.length && !topComment; tc++) {
-                    var bodyEl = commentNodes[tc].querySelector(
+                //
+                // Le corps du commentaire n'a plus de conteneur d\u00e9di\u00e9 dans le rendu
+                // atomis\u00e9 : on le d\u00e9limite comme pour le post lui-m\u00eame, en partant de
+                // l'horodatage (l'en-t\u00eate — nom, badge, degr\u00e9, accroche — le pr\u00e9c\u00e8de)
+                // et en s'arr\u00eatant \u00e0 la premi\u00e8re ligne d'action ou de compteur.
+                function commentBodyFromNode(node) {
+                    var bodyEl = node.querySelector(
                         '.comments-comment-item-content-body, .update-components-text, ' +
                         '.comments-comment-item__main-content'
                     );
-                    var rawTop = (((bodyEl || commentNodes[tc]).innerText) || "").trim();
+                    if (bodyEl) {
+                        var direct = (bodyEl.innerText || "").trim();
+                        if (direct) return direct;
+                    }
+                    var cl = (node.innerText || "").split("\\n").map(function (l) {
+                        return l.trim();
+                    }).filter(Boolean);
+                    var afterTime = -1;
+                    for (var i = 0; i < cl.length && afterTime < 0; i++) {
+                        if (isTimeLine(cl[i])) afterTime = i + 1;
+                    }
+                    if (afterTime < 0) return "";
+                    var skipLines = {
+                        "Suivre": 1, "Follow": 1, "Suivi": 1, "Following": 1,
+                        "Auteur": 1, "Author": 1, "Modifi\u00e9": 1, "Edited": 1,
+                        "Se connecter": 1, "Connect": 1,
+                    };
+                    var stopRe = /^(?:\u2026\\s*plus|\\.{3}\\s*plus|Voir plus|See more|J.aime|Like|R\u00e9pondre|Reply|Commenter|Comment)$/i;
+                    var countRe = /^\\d[\\d\\s.,]*k?\\s*(?:r\u00e9actions?|reactions?|commentaires?|comments?|r\u00e9ponses?|replies?)/i;
+                    // Puces de compteur rendues en chiffre nu (« 0 », « 1 », « 13 ») :
+                    // elles suivent le corps du commentaire et le polluaient.
+                    var bareNumRe = /^\\d[\\d\\s.,]*k?$/;
+                    var parts = [];
+                    for (var i = afterTime; i < cl.length; i++) {
+                        if (skipLines[cl[i]]) continue;
+                        if (stopRe.test(cl[i]) || countRe.test(cl[i]) || bareNumRe.test(cl[i])) break;
+                        parts.push(cl[i]);
+                    }
+                    return parts.join("\\n").trim();
+                }
+
+                var topComment = "";
+                for (var tc = 0; tc < commentNodes.length && !topComment; tc++) {
+                    var rawTop = commentBodyFromNode(commentNodes[tc]);
                     if (rawTop) topComment = rawTop.slice(0, 2000);
                 }
 
