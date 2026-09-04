@@ -147,6 +147,8 @@ class BrowserManager:
         # couperait l'herbe sous le pied de ses autres clients.
         self._owns_context = True
         self._page: Optional[Page] = None
+        # False quand la page préexistait dans le profil du navigateur distant.
+        self._owns_page = True
         self._is_authenticated = False
     
     async def __aenter__(self) -> "BrowserManager":
@@ -195,12 +197,12 @@ class BrowserManager:
                 self._context = self._browser.contexts[0]
                 self._owns_context = False
                 logger.info("Contexte persistant du navigateur distant réutilisé")
+                await self._adopt_page_in_persistent_context()
             else:
                 self._context = await self._browser.new_context(**context_options)
                 self._owns_context = True
-            
-            # Create initial page
-            self._page = await self._context.new_page()
+                self._page = await self._context.new_page()
+                self._owns_page = True
             
             logger.info("Browser context and page created")
             
@@ -208,6 +210,29 @@ class BrowserManager:
             await self.close()
             raise NetworkError(f"Failed to start browser: {e}")
     
+    async def _adopt_page_in_persistent_context(self) -> None:
+        """Choisit l'onglet de travail dans le profil du navigateur distant.
+
+        On réutilise un onglet existant plutôt que d'en ouvrir un : le serveur MCP
+        relance son navigateur dès que sa sonde de vivacité échoue, et ouvrir un
+        onglet à chaque fois faisait enfler le profil partagé jusqu'à rendre le
+        Chromium de l'hôte (MemoryMax=2G) totalement muet.
+
+        L'onglet est ensuite mis au premier plan : un onglet d'arrière-plan est
+        gelé par Chrome, ce qui suffit à faire expirer un simple ``evaluate`` — et
+        c'est aussi ce qui empêche les widgets de vérification de démarrer.
+        """
+        if self._context.pages:
+            self._page = self._context.pages[0]
+            self._owns_page = False
+        else:
+            self._page = await self._context.new_page()
+            self._owns_page = True
+        try:
+            await self._page.bring_to_front()
+        except Exception as exc:
+            logger.debug("bring_to_front sans effet : %s", exc)
+
     def _use_persistent_context(self) -> bool:
         """True si l'on doit réutiliser le contexte du navigateur distant."""
         return bool(
@@ -238,8 +263,10 @@ class BrowserManager:
         """Close browser and cleanup resources."""
         try:
             if self._page:
-                await self._page.close()
+                if self._owns_page:
+                    await self._page.close()
                 self._page = None
+                self._owns_page = True
             
             if self._context:
                 if self._owns_context:
@@ -370,9 +397,7 @@ class BrowserManager:
             logger.info(
                 "Session injectée dans le contexte persistant du navigateur distant"
             )
-            if self._page:
-                await self._page.close()
-            self._page = await self._context.new_page()
+            await self._adopt_page_in_persistent_context()
             self._is_authenticated = True
             return
 

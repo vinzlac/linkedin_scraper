@@ -99,6 +99,10 @@ class _FakeCtx:
 class _FakePage:
     def __init__(self):
         self.closed = False
+        self.brought_to_front = False
+
+    async def bring_to_front(self):
+        self.brought_to_front = True
 
     async def close(self):
         self.closed = True
@@ -192,3 +196,42 @@ class TestPersistentContext:
         assert existing.closed is False, "le contexte du navigateur ne doit jamais être fermé"
         assert mgr._browser.new_contexts == 0, "aucun repli sur un contexte isolé"
         assert mgr._context is existing
+
+    @pytest.mark.asyncio
+    async def test_reuses_an_existing_page_instead_of_opening_one(self, tmp_path):
+        """Ouvrir un onglet à chaque démarrage fait fuir le profil partagé : la sonde
+        de vivacité du serveur MCP relance le navigateur toutes les quelques minutes,
+        et le Chromium de l'hôte (MemoryMax=2G) a fini par ne plus répondre du tout."""
+        page = _FakePage()
+        existing = _FakeCtx(pages=[page])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert mgr._page is page, "l'onglet existant doit être réutilisé"
+        assert existing._new_pages == 0, "aucun onglet supplémentaire ne doit être ouvert"
+        assert page.brought_to_front, "l'onglet doit être mis au premier plan"
+
+    @pytest.mark.asyncio
+    async def test_does_not_close_a_page_it_did_not_open(self, tmp_path):
+        page = _FakePage()
+        existing = _FakeCtx(pages=[page])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        await mgr.close()
+
+        assert page.closed is False, "fermer un onglet préexistant casserait les autres clients"
+
+    @pytest.mark.asyncio
+    async def test_opens_a_page_when_the_context_has_none(self, tmp_path):
+        existing = _FakeCtx(pages=[])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert existing._new_pages == 1
+        assert mgr._page.brought_to_front
