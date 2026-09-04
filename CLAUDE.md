@@ -66,16 +66,26 @@ All scrapers inherit `BaseScraper` (`scrapers/base.py`) which wraps `core/` help
 
 **Scraper pattern:** `scrape(url, limit)` → navigate → wait for content → scroll loop with deduplication by URN → return list of Pydantic models.
 
-Post content is extracted via `page.evaluate()` (inline JS) rather than Playwright locators, because LinkedIn's CSS class names are obfuscated and unstable. Activity URNs (`urn:li:activity:XXXXXX`) are the stable anchor — each post element has `data-urn` set to its URN.
+Post content is extracted via `page.evaluate()` (inline JS) rather than Playwright locators, because LinkedIn's CSS class names are obfuscated and unstable.
+
+**No LinkedIn DOM attribute is a contract.** The September 2026 feed rewrite removed `data-urn`, `<time>`, the comment classes and every count-bearing `aria-label` at once — `[componentkey]` was the only survivor. Anchor on what the user sees (FR/EN labels, line shape, position relative to the action bar) and on invariant structure (one Repost button per card, timestamp precedes content); treat attributes as opportunistic shortcuts with a fallback. A post's canonical identity is derived from its permalink, never from a `urn:li:compkey:` (a feed-card key, ephemeral and session-dependent). See [ADR-020](docs/adr/020-feed-dom-anchors-after-2026-09-rendering.md) — it supersedes ADR-004.
+
+Any selector fix must be verified against the **live** feed before being considered done, then frozen in a DOM fixture (see the headless tests in `tests/test_feed_scraper.py`).
 
 ### `models/`
 
 All models are Pydantic `BaseModel`. `Post` is shared between `CompanyPostsScraper` and `FeedScraper`:
 
 ```python
-Post: linkedin_url, urn, author_name, author_url, text, posted_date,
-      reactions_count, comments_count, reposts_count, image_urls, video_url, article_url
+Post: linkedin_url, urn, feed_compkey, author_name, author_url, actor_name, actor_url,
+      text, posted_date, reactions_count, comments_count, reposts_count,
+      image_urls, video_url, article_url, comments, top_comment
 ```
+
+- `urn` is the **dedup key**, `linkedin_url` the **navigable address** — they are not redundant: the id in a `-share-` / `-ugcPost-` slug is not always a valid activity id, so `/feed/update/urn:li:activity:<id>/` can 404 where the original permalink loads fine.
+- `feed_compkey` holds the `urn:li:compkey:` when LinkedIn only exposed that — debug only, never an identifier.
+- `actor_*` is the network contact who surfaced the post (« Y a republié ce contenu », « Suivi par Y »); `author_*` is who wrote it.
+- `comments` only holds comments carrying an external link (feeds the link-extraction pipeline); `top_comment` is the first visible comment, unfiltered.
 
 ## Key conventions
 
