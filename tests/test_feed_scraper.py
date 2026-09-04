@@ -739,6 +739,87 @@ class TestExpandVisibleCommentsDom:
         assert clicks == 0
 
 
+class TestCommentExpansionBudget:
+    """Le plafond de clics doit valoir pour un scrape entier, pas pour une passe.
+
+    Constaté en prod le 2026-09-04 : `_extract_posts_from_feed()` est rappelée à
+    chaque itération de scroll par `_scrape_posts()`, et relançait l'expansion à
+    chaque fois. Le plafond de 8 était donc un plafond *par passe* — jusqu'à
+    8 × (3·limit + 10) clics pour un seul `scrape()`. Les logs de prod montraient
+    « 4 » puis « 6 » pour un même appel.
+    """
+
+    def _make_scraper(self):
+        page = MagicMock()
+        page.wait_for_timeout = AsyncMock()
+        return FeedScraper(page)
+
+    @pytest.mark.asyncio
+    async def test_budget_is_shared_across_extraction_passes(self):
+        scraper = self._make_scraper()
+        budgets = []
+
+        async def fake_evaluate(js, budget):
+            budgets.append(budget)
+            return min(3, budget)
+
+        scraper.page.evaluate = AsyncMock(side_effect=fake_evaluate)
+        scraper._reset_comment_expand_budget()
+
+        for _ in range(4):
+            await scraper._expand_visible_comments_for_url_scrape()
+
+        # 8 de budget : 3 + 3 + 2, puis plus rien — et on n'appelle même plus la page
+        assert budgets == [8, 5, 2], budgets
+        assert scraper._comment_expand_budget == 0
+
+    @pytest.mark.asyncio
+    async def test_budget_is_reset_by_a_new_scrape(self):
+        scraper = self._make_scraper()
+        scraper.page.evaluate = AsyncMock(return_value=8)
+        scraper._reset_comment_expand_budget()
+
+        await scraper._expand_visible_comments_for_url_scrape()
+        assert scraper._comment_expand_budget == 0
+
+        scraper._reset_comment_expand_budget()
+        assert scraper._comment_expand_budget > 0
+
+    @pytest.mark.asyncio
+    async def test_does_not_reopen_a_thread_already_rendered(self):
+        """Le contrôle « N commentaires » reste affiché une fois le fil ouvert :
+        sans garde, chaque passe le recliquait."""
+        from playwright.async_api import async_playwright
+
+        html = """
+        <html><body>
+          <div>
+            <div id="ctrl" role="button" onclick="
+                 var d = document.createElement('div');
+                 d.setAttribute('componentkey', 'replaceableComment_urn:li:comment:(x,1)');
+                 d.textContent = 'un commentaire';
+                 document.getElementById('card').appendChild(d);">3 commentaires</div>
+            <div id="card"></div>
+            <button>Republier</button>
+          </div>
+        </body></html>
+        """
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                scraper = FeedScraper(page)
+                scraper._reset_comment_expand_budget()
+                first = await scraper._expand_visible_comments_for_url_scrape()
+                second = await scraper._expand_visible_comments_for_url_scrape()
+            finally:
+                await browser.close()
+
+        assert first == 1, "le fil aurait dû être ouvert au premier passage"
+        assert second == 0, "fil déjà ouvert : ne pas recliquer"
+
+
 # ---------------------------------------------------------------------------
 # Integration tests (require a real LinkedIn session)
 # ---------------------------------------------------------------------------
