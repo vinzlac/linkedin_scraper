@@ -351,9 +351,14 @@ class BrowserManager:
         if not Path(filepath).exists():
             raise FileNotFoundError(f"Session file not found: {filepath}")
         
-        # Close existing context and create new one with stored state
+        # Fermer le contexte courant — sauf s'il appartient au navigateur distant :
+        # en mode persistant c'est son contexte par défaut, le détruire revient à
+        # jeter le profil (et donc l'appareil connu de LinkedIn) à chaque
+        # chargement de session, en plus de casser ses autres clients.
         if self._context:
-            await self._context.close()
+            if self._owns_context:
+                await self._context.close()
+            self._context = None
         
         if not self._browser:
             raise RuntimeError("Browser not started")
