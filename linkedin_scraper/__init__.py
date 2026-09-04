@@ -19,6 +19,7 @@ from .core import (
     # Exceptions
     LinkedInScraperException,
     AuthenticationError,
+    CheckpointError,
     RateLimitError,
     ElementNotFoundError,
     ProfileNotFoundError,
@@ -87,6 +88,7 @@ __all__ = [
     # Exceptions
     "LinkedInScraperException",
     "AuthenticationError",
+    "CheckpointError",
     "RateLimitError",
     "ElementNotFoundError",
     "ProfileNotFoundError",

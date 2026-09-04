@@ -11,6 +11,20 @@ class AuthenticationError(LinkedInScraperException):
     pass
 
 
+class CheckpointError(AuthenticationError):
+    """Raised when LinkedIn shows a security checkpoint / challenge.
+
+    Distincte d'une session expirée : les cookies restent valides, mais LinkedIn
+    exige une vérification humaine (code e-mail, puzzle, confirmation d'appareil).
+    Réessayer ne fait qu'aggraver le signal côté LinkedIn — il faut résoudre le
+    challenge dans un navigateur, puis regénérer la session de scraping.
+
+    Sous-classe d'``AuthenticationError`` pour ne rien casser chez les appelants
+    qui l'attrapent déjà.
+    """
+    pass
+
+
 class RateLimitError(LinkedInScraperException):
     """Raised when rate limiting is detected."""
     

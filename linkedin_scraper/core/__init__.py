@@ -5,6 +5,7 @@ from .auth import (
     login_with_credentials,
     login_with_cookie,
     is_logged_in,
+    has_login_form,
     wait_for_manual_login,
     load_credentials_from_env,
     warm_up_browser
@@ -12,6 +13,7 @@ from .auth import (
 from .exceptions import (
     LinkedInScraperException,
     AuthenticationError,
+    CheckpointError,
     RateLimitError,
     ElementNotFoundError,
     ProfileNotFoundError,
@@ -45,12 +47,14 @@ __all__ = [
     'login_with_credentials',
     'login_with_cookie',
     'is_logged_in',
+    'has_login_form',
     'wait_for_manual_login',
     'load_credentials_from_env',
     'warm_up_browser',
     # Exceptions
     'LinkedInScraperException',
     'AuthenticationError',
+    'CheckpointError',
     'RateLimitError',
     'ElementNotFoundError',
     'ProfileNotFoundError',

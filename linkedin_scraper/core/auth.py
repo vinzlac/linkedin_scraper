@@ -242,6 +242,27 @@ async def login_with_cookie(page: Page, cookie_value: str) -> None:
          raise AuthenticationError(f"Cookie authentication error: {e}")
 
 
+# Champs d'un vrai formulaire de connexion LinkedIn. Leur présence distingue une
+# session réellement morte du rebond transitoire décrit dans ensure_logged_in().
+_LOGIN_FORM_SELECTOR = 'input[name="session_key"], input#username, input[name="session_password"]'
+
+
+async def has_login_form(page: Page) -> bool:
+    """True si la page affiche un formulaire de connexion à remplir.
+
+    Une URL sous ``/login`` ne suffit pas à conclure : depuis le 2026-09-04,
+    LinkedIn fait transiter une visite authentifiée de ``/feed/`` par
+    ``/uas/login`` puis ``/login/?session_redirect=…`` avant de revenir sur le
+    feed, connecté (ré-authentification via le cookie ``li_rm``). Pendant ce
+    rebond, aucun champ de saisie n'est rendu — c'est ce qui permet de le
+    distinguer d'une déconnexion réelle.
+    """
+    try:
+        return await page.locator(_LOGIN_FORM_SELECTOR).count() > 0
+    except Exception:
+        return False
+
+
 async def is_logged_in(page: Page) -> bool:
     """
     Check if currently logged in to LinkedIn.
