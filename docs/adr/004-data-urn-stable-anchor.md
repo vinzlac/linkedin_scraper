@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR-020](020-feed-dom-anchors-after-2026-09-rendering.md)
+
+> **2026-09-03** — `data-urn` a disparu du rendu du feed, en même temps que `<time>`,
+> les classes de commentaires et les `aria-label` portant les compteurs. Le postulat
+> central de cet ADR (« LinkedIn le maintient car c'est leur système d'adressage
+> interne ») ne tient plus. L'identité d'un post se dérive désormais du permalien —
+> voir [ADR-020](020-feed-dom-anchors-after-2026-09-rendering.md). La stratégie
+> `data-urn` reste en place comme repli opportuniste, sans être le chemin nominal.
 
 ## Context
 

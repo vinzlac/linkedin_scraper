@@ -19,7 +19,7 @@ Chaque ADR suit le format :
 | [001](001-playwright-over-official-api.md) | Playwright plutôt que l'API officielle LinkedIn | Accepted |
 | [002](002-headless-false-required.md) | headless=False obligatoire contre la détection anti-bot | Accepted |
 | [003](003-js-evaluation-over-locators.md) | page.evaluate() plutôt que les locators Playwright | Accepted |
-| [004](004-data-urn-stable-anchor.md) | data-urn comme ancre stable pour l'identification des posts | Accepted |
+| [004](004-data-urn-stable-anchor.md) | data-urn comme ancre stable pour l'identification des posts | Superseded by 020 |
 | [005](005-playwright-storage-state.md) | Playwright storage state pour la gestion de session | Accepted |
 | [006](006-pydantic-models.md) | Pydantic pour les modèles de données | Accepted |
 | [007](007-async-architecture.md) | Architecture full async/await | Accepted |
@@ -35,3 +35,4 @@ Chaque ADR suit le format :
 | [017](017-remote-cdp-homelab-chromium.md) | Connexion CDP au Chromium partagé du homelab (k3s-homelab / OpenClaw Phase 10) | Accepted |
 | [018](018-pypi-publication.md) | Publication PyPI sous `linkedin-playwright-scraper` | Accepted |
 | [019](019-invitation-subtype-classification-showcase-event.md) | Classification par pattern d'URL pour les sous-types d'invitation (Showcase, Event) | Accepted |
+| [020](020-feed-dom-anchors-after-2026-09-rendering.md) | Ancres DOM et identité de post après la refonte du rendu du feed (septembre 2026) | Accepted |
