@@ -8,6 +8,7 @@ from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from ..callbacks import ProgressCallback, SilentCallback
 from ..core import (
     is_logged_in,
+    has_login_form,
     detect_rate_limit,
     scroll_to_bottom,
     scroll_to_half,
@@ -17,7 +18,7 @@ from ..core import (
     retry_async,
     check_cooldown,
 )
-from ..core.exceptions import AuthenticationError, ScrapingError
+from ..core.exceptions import AuthenticationError, CheckpointError, ScrapingError
 
 logger = logging.getLogger(__name__)
 
@@ -40,30 +41,59 @@ class BaseScraper:
         """
         Verify user is authenticated.
 
-        Retries a few times before giving up: is_logged_in() checks for
-        rendered nav DOM elements right after navigate_and_wait(), which only
-        waits for `domcontentloaded` — on a cold browser start LinkedIn's SPA
-        nav bar may not have hydrated yet, causing a false "not logged in"
-        even with a fully valid session (the retry that follows on the
-        caller's side then succeeds, because by then the page has hydrated).
+        Deux raisons de ne pas conclure au premier essai :
+
+        1. ``is_logged_in()`` cherche des éléments de nav rendus juste après
+           ``navigate_and_wait()``, qui n'attend que ``domcontentloaded`` — sur un
+           navigateur froid, la nav SPA de LinkedIn peut ne pas être hydratée.
+        2. Depuis le 2026-09-04, LinkedIn fait transiter une visite authentifiée de
+           ``/feed/`` par ``/uas/login`` puis ``/login/?session_redirect=…`` avant de
+           revenir sur le feed, connecté (ré-authentification via ``li_rm``). Mesuré
+           en production : la page stationne ~6 s sur ``/login/`` et n'atteint l'état
+           authentifié qu'à ~8 s. ``is_logged_in()`` renvoie False pendant tout ce
+           rebond (fail-fast sur les URL d'auth), et l'ancien budget de 3 s expirait
+           avant l'atterrissage : faux « Not logged in » sur une session valide.
+
+        Le budget d'attente couvre donc ce rebond, mais on abandonne immédiatement
+        si un vrai formulaire de connexion est rendu — signe d'une session
+        réellement morte, qu'aucune attente ne réparera.
 
         Raises:
             AuthenticationError: If still not logged in after retrying
         """
-        delays = (0, 1.0, 2.0)
+        delays = (0, 1.0, 2.0, 3.0, 5.0)
         for attempt, delay in enumerate(delays):
             if delay:
                 await asyncio.sleep(delay)
             if await is_logged_in(self.page):
                 return
+            if self._is_checkpoint_url(getattr(self.page, "url", "") or ""):
+                raise CheckpointError(
+                    "LinkedIn security checkpoint. Les cookies sont valides mais "
+                    "LinkedIn exige une vérification humaine : ouvre la session dans "
+                    "un navigateur, résous le challenge, puis regénère la session de "
+                    "scraping. Ne pas réessayer en boucle — cela renforce la "
+                    "détection côté LinkedIn."
+                )
+            if await has_login_form(self.page):
+                logger.info(
+                    "ensure_logged_in: formulaire de connexion affiché — "
+                    "session morte, inutile d'attendre le rebond"
+                )
+                break
             logger.debug(
-                "ensure_logged_in: pas encore connecté (essai %s/%s)",
-                attempt + 1, len(delays),
+                "ensure_logged_in: pas encore connecté (essai %s/%s, url=%s)",
+                attempt + 1, len(delays), getattr(self.page, "url", "?"),
             )
         raise AuthenticationError(
             "Not logged in. Please authenticate before scraping."
         )
-    
+
+    @staticmethod
+    def _is_checkpoint_url(url: str) -> bool:
+        """True si l'URL est un écran de vérification de sécurité LinkedIn."""
+        return "/checkpoint/" in url or "/challenge" in url
+
     async def check_rate_limit(self) -> None:
         """
         Check for rate limiting.

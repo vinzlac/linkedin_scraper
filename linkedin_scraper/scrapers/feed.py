@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 # later call once the cache is warm.
 _MAX_UI_FALLBACK_PER_CALL = 4
 
+# Plafond de clics d'ouverture de fils de commentaires pour UN scrape entier.
+# Il valait auparavant par appel de _expand_visible_comments_for_url_scrape(),
+# donc par passe d'extraction — or _scrape_posts() rappelle l'extraction à chaque
+# itération de scroll (jusqu'à 3·limit + 10 fois). Le plafond ne plafonnait donc
+# pas ce qu'on croyait : mesuré en prod le 2026-09-04, « 4 » puis « 6 » clics pour
+# un seul scrape_feed. Même motivation que _MAX_UI_FALLBACK_PER_CALL : limiter le
+# signal d'automatisation envoyé à LinkedIn (rate limit du 2026-07-22, checkpoint
+# du 2026-09-04).
+_MAX_COMMENT_EXPAND_CLICKS_PER_SCRAPE = 8
+
 FEED_URL = "https://www.linkedin.com/feed/"
 
 # Identifiant numérique d'un post dans un permalien LinkedIn.
@@ -75,6 +85,29 @@ _EXPAND_COMMENTS_JS = r"""
   var moreRe = /^(voir|afficher|load|show)\s.*(commentaires?|comments?)/i;
   var composerRe = /^(commenter|comment|écrire un commentaire|write a comment|add a comment)$/i;
   var excludeRe = /option|menu|réagir|react|répondre|reply/i;
+  function isRepostBtn(b) {
+    var t = (b.innerText || "").trim();
+    if (t === "Republier" || t === "Repost") return true;
+    var a = (b.getAttribute("aria-label") || "").trim();
+    return /^Republier\b/i.test(a) || /^Repost\b/i.test(a);
+  }
+  // Carte du post contenant ce contrôle : le premier ancêtre qui porte un bouton
+  // Republier (même repère que l'extraction des posts).
+  function cardOf(el) {
+    var n = el;
+    for (var d = 0; d < 15 && n && n !== document.body; d++) {
+      if (n.querySelectorAll && Array.from(n.querySelectorAll("button")).some(isRepostBtn)) {
+        return n;
+      }
+      n = n.parentElement;
+    }
+    return null;
+  }
+  function alreadyExpanded(el) {
+    var card = cardOf(el);
+    return !!(card && card.querySelector('[componentkey^="replaceableComment_"], .comments-comment-item'));
+  }
+
   var ctrls = Array.from(document.querySelectorAll('button, [role="button"]'));
   var clicked = 0;
   for (var i = 0; i < ctrls.length && clicked < maxClicks; i++) {
@@ -86,6 +119,9 @@ _EXPAND_COMMENTS_JS = r"""
     }).filter(Boolean);
     var label = lines.length ? lines[0] : "";
     if (composerRe.test(label) || composerRe.test(aria)) continue;
+    // Le compteur reste affiché une fois le fil ouvert : sans cette garde, chaque
+    // passe d'extraction recliquait les mêmes fils.
+    if (alreadyExpanded(el)) continue;
     if (excludeRe.test(aria) || excludeRe.test(label)) continue;
     if (!(countRe.test(label) || moreRe.test(label) || countRe.test(aria) || moreRe.test(aria))) continue;
     try {
@@ -101,9 +137,15 @@ class FeedScraper(BaseScraper):
 
     def __init__(self, page: Page, callback: Optional[ProgressCallback] = None):
         super().__init__(page, callback or SilentCallback())
+        self._comment_expand_budget = _MAX_COMMENT_EXPAND_CLICKS_PER_SCRAPE
+
+    def _reset_comment_expand_budget(self) -> None:
+        """Rend son budget de clics d'ouverture de commentaires à un nouveau scrape."""
+        self._comment_expand_budget = _MAX_COMMENT_EXPAND_CLICKS_PER_SCRAPE
 
     async def scrape(self, limit: int = 10) -> List[Post]:
         logger.info(f"Starting feed scraping (limit={limit})")
+        self._reset_comment_expand_budget()
         await self.callback.on_start("feed", FEED_URL)
 
         await self.navigate_and_wait(FEED_URL)
@@ -155,6 +197,7 @@ class FeedScraper(BaseScraper):
     async def scrape_post_by_url(self, post_url: str) -> List[Post]:
         """Scrape un post LinkedIn précis depuis son URL /feed/update/ ou /posts/."""
         logger.info("Starting single post scraping: %s", post_url)
+        self._reset_comment_expand_budget()
         await self.callback.on_start("feed_single_post", post_url)
         await self.navigate_and_wait(post_url)
         await self.ensure_logged_in()
@@ -1409,7 +1452,9 @@ class FeedScraper(BaseScraper):
             )
         return normalized
 
-    async def _expand_visible_comments_for_url_scrape(self, max_clicks: int = 8) -> int:
+    async def _expand_visible_comments_for_url_scrape(
+        self, max_clicks: Optional[int] = None
+    ) -> int:
         """Ouvre les fils de commentaires visibles pour que leur DOM existe.
 
         Best effort, ne lève jamais. Le plafond de clics est conservé tel quel :
@@ -1419,8 +1464,13 @@ class FeedScraper(BaseScraper):
         Returns:
             Nombre de contrôles cliqués (0 s'il n'y avait rien à ouvrir).
         """
+        budget = self._comment_expand_budget if max_clicks is None else max_clicks
+        if budget <= 0:
+            logger.debug("Budget d'ouverture de commentaires épuisé pour ce scrape")
+            return 0
+
         try:
-            clicked = await self.page.evaluate(_EXPAND_COMMENTS_JS, max_clicks)
+            clicked = await self.page.evaluate(_EXPAND_COMMENTS_JS, budget)
         except Exception as exc:
             logger.debug("Expansion des commentaires ignorée : %s", exc)
             return 0
@@ -1430,8 +1480,14 @@ class FeedScraper(BaseScraper):
         except (TypeError, ValueError):
             return 0
 
+        if max_clicks is None:
+            self._comment_expand_budget = max(0, self._comment_expand_budget - clicked)
+
         if clicked:
-            logger.info("Fils de commentaires ouverts : %s", clicked)
+            logger.info(
+                "Fils de commentaires ouverts : %s (budget restant : %s)",
+                clicked, self._comment_expand_budget,
+            )
             await self.page.wait_for_timeout(1200)
         return clicked
 
