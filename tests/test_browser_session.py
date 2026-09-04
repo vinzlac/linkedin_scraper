@@ -173,3 +173,22 @@ class TestPersistentContext:
 
         assert mgr._browser.new_contexts == 1
         assert mgr._context is not mgr._browser.contexts[0]
+
+    @pytest.mark.asyncio
+    async def test_load_session_never_closes_the_shared_context(self, tmp_path):
+        """Régression : `load_session()` fermait le contexte existant avant même de
+        tester s'il fallait le réutiliser. En mode persistant, ce contexte est celui
+        du navigateur : il était donc détruit à chaque chargement de session, et le
+        scraper retombait sur un contexte isolé — jusqu'à casser la connexion CDP
+        (« Target page, context or browser has been closed »)."""
+        existing = _FakeCtx()
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+        session = _session_file(tmp_path)
+
+        await mgr.load_session(str(session))
+        await mgr.load_session(str(session))   # deuxième appel : le cas qui cassait
+
+        assert existing.closed is False, "le contexte du navigateur ne doit jamais être fermé"
+        assert mgr._browser.new_contexts == 0, "aucun repli sur un contexte isolé"
+        assert mgr._context is existing
