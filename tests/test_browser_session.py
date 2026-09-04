@@ -1,6 +1,10 @@
 """Tests du chargement de session et de l'empreinte du navigateur (incident 2026-09-04)."""
 import json
 
+import pytest
+
+from linkedin_scraper import BrowserManager
+
 from linkedin_scraper.core.browser import (
     normalize_headless_user_agent,
     sanitize_storage_state,
@@ -66,3 +70,106 @@ class TestNormalizeHeadlessUserAgent:
     def test_handles_missing_user_agent(self):
         assert normalize_headless_user_agent(None) is None
         assert normalize_headless_user_agent("") is None
+
+# ---------------------------------------------------------------------------
+# Contexte persistant (incident 2026-09-04)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCtx:
+    def __init__(self, pages=None):
+        self.pages = pages or []
+        self.added = []
+        self.closed = False
+        self._new_pages = 0
+
+    async def add_cookies(self, cookies):
+        self.added.extend(cookies)
+
+    async def new_page(self):
+        self._new_pages += 1
+        page = _FakePage()
+        self.pages.append(page)
+        return page
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakePage:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeBrowser:
+    def __init__(self, contexts):
+        self.contexts = contexts
+        self.new_contexts = 0
+        self.closed = False
+
+    async def new_context(self, **kwargs):
+        self.new_contexts += 1
+        ctx = _FakeCtx()
+        self.contexts.append(ctx)
+        return ctx
+
+    async def close(self):
+        self.closed = True
+
+
+def _session_file(tmp_path):
+    p = tmp_path / "session.json"
+    p.write_text(json.dumps({"cookies": [
+        {"name": "li_at", "value": "x", "domain": ".linkedin.com", "path": "/"},
+        {"name": "_px3", "value": "y", "domain": ".linkedin.com", "path": "/",
+         "partitionKey": {"sourceOrigin": "https://www.linkedin.com"}},
+    ], "origins": []}), encoding="utf-8")
+    return p
+
+
+class TestPersistentContext:
+    """LinkedIn traite chaque contexte neuf comme un appareil inconnu et redemande
+    une vérification de sécurité. Constaté le 2026-09-04 : un identifiant de
+    challenge différent à CHAQUE scrape, quels que soient la session, l'IP ou la
+    version du navigateur. Réutiliser le profil persistant du navigateur dédié
+    donne un appareil stable, pour lequel une seule vérification suffit."""
+
+    @pytest.mark.asyncio
+    async def test_reuses_the_browsers_own_context(self, tmp_path):
+        existing = _FakeCtx()
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert mgr._context is existing, "le contexte du navigateur doit être réutilisé"
+        assert mgr._browser.new_contexts == 0, "aucun contexte isolé ne doit être créé"
+        assert [c["name"] for c in existing.added] == ["li_at", "_px3"]
+        assert all("partitionKey" not in c for c in existing.added)
+
+    @pytest.mark.asyncio
+    async def test_does_not_close_a_context_it_does_not_own(self, tmp_path):
+        existing = _FakeCtx()
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+        await mgr.load_session(str(_session_file(tmp_path)))
+        page = mgr._page
+
+        assert mgr._context is existing
+        await mgr.close()
+
+        assert existing.closed is False, "fermer le contexte partagé casserait les autres clients"
+        assert page.closed is True, "la page créée par le scraper, elle, doit être fermée"
+
+    @pytest.mark.asyncio
+    async def test_default_behaviour_still_creates_an_isolated_context(self, tmp_path):
+        mgr = BrowserManager(cdp_url="http://x:9222")   # persistent_context non demandé
+        mgr._browser = _FakeBrowser([_FakeCtx()])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert mgr._browser.new_contexts == 1
+        assert mgr._context is not mgr._browser.contexts[0]

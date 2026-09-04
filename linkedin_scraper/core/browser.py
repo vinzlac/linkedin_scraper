@@ -59,6 +59,17 @@ def sanitize_storage_state(filepath: str) -> Path:
     return tmp_path
 
 
+def storage_state_cookies(filepath: str) -> list:
+    """Cookies d'un storage state, débarrassés des champs qu'un vieux CDP refuse."""
+    state = json.loads(Path(filepath).read_text(encoding="utf-8"))
+    cookies = []
+    for cookie in state.get("cookies", []):
+        for field in _UNSUPPORTED_COOKIE_FIELDS:
+            cookie.pop(field, None)
+        cookies.append(cookie)
+    return cookies
+
+
 def normalize_headless_user_agent(user_agent: Optional[str]) -> Optional[str]:
     """User-agent sans le marqueur ``HeadlessChrome``.
 
@@ -87,6 +98,7 @@ class BrowserManager:
         viewport: Optional[Dict[str, int]] = None,
         user_agent: Optional[str] = None,
         cdp_url: Optional[str] = None,
+        persistent_context: bool = False,
         **launch_options: Any
     ):
         """
@@ -103,6 +115,20 @@ class BrowserManager:
                 (e.g. "http://192.168.1.153:9222") instead of launching a new
                 local browser. See ADR-017: the browser then runs on a remote
                 host and no window ever appears locally, regardless of headless.
+            persistent_context: réutiliser le contexte du navigateur distant
+                (son profil sur disque) au lieu d'en créer un isolé à chaque
+                démarrage. Sans effet hors CDP.
+
+                LinkedIn traite un contexte neuf comme un appareil inconnu et
+                redemande une vérification de sécurité : le 2026-09-04, un
+                identifiant de challenge différent est apparu à chaque scrape,
+                quels que soient la session, l'IP ou la version du navigateur.
+                Le profil persistant donne un appareil stable, pour lequel une
+                seule vérification suffit.
+
+                Contrepartie : les cookies vivent dans le profil du navigateur,
+                partagé avec ses autres clients — à n'activer que sur un
+                navigateur dédié.
             **launch_options: Additional Playwright launch options (ignored when
                 cdp_url is set)
         """
@@ -111,11 +137,15 @@ class BrowserManager:
         self.viewport = viewport or {"width": 1280, "height": 720}
         self.user_agent = user_agent
         self.cdp_url = cdp_url
+        self.persistent_context = persistent_context
         self.launch_options = launch_options
 
         self._playwright: Optional[Playwright] = None
         self._browser: Optional[Browser] = None
         self._context: Optional[BrowserContext] = None
+        # False quand le contexte appartient au navigateur distant : le fermer
+        # couperait l'herbe sous le pied de ses autres clients.
+        self._owns_context = True
         self._page: Optional[Page] = None
         self._is_authenticated = False
     
@@ -160,8 +190,14 @@ class BrowserManager:
             
             if self.user_agent:
                 context_options["user_agent"] = self.user_agent
-            
-            self._context = await self._browser.new_context(**context_options)
+
+            if self._use_persistent_context():
+                self._context = self._browser.contexts[0]
+                self._owns_context = False
+                logger.info("Contexte persistant du navigateur distant réutilisé")
+            else:
+                self._context = await self._browser.new_context(**context_options)
+                self._owns_context = True
             
             # Create initial page
             self._page = await self._context.new_page()
@@ -172,6 +208,15 @@ class BrowserManager:
             await self.close()
             raise NetworkError(f"Failed to start browser: {e}")
     
+    def _use_persistent_context(self) -> bool:
+        """True si l'on doit réutiliser le contexte du navigateur distant."""
+        return bool(
+            self.persistent_context
+            and self.cdp_url
+            and self._browser
+            and self._browser.contexts
+        )
+
     def _probe_cdp_user_agent(self) -> Optional[str]:
         """User-agent annoncé par le navigateur distant, via ``/json/version``.
 
@@ -197,8 +242,15 @@ class BrowserManager:
                 self._page = None
             
             if self._context:
-                await self._context.close()
+                if self._owns_context:
+                    await self._context.close()
+                else:
+                    logger.debug(
+                        "Contexte persistant laissé ouvert (il appartient au "
+                        "navigateur distant)"
+                    )
                 self._context = None
+                self._owns_context = True
             
             if self._browser:
                 # For a CDP connection, Playwright's Browser.close() disconnects
@@ -306,6 +358,19 @@ class BrowserManager:
         if not self._browser:
             raise RuntimeError("Browser not started")
         
+        if self._use_persistent_context():
+            self._context = self._browser.contexts[0]
+            self._owns_context = False
+            await self._context.add_cookies(storage_state_cookies(filepath))
+            logger.info(
+                "Session injectée dans le contexte persistant du navigateur distant"
+            )
+            if self._page:
+                await self._page.close()
+            self._page = await self._context.new_page()
+            self._is_authenticated = True
+            return
+
         state_path = sanitize_storage_state(filepath)
         try:
             self._context = await self._browser.new_context(
@@ -313,6 +378,7 @@ class BrowserManager:
                 viewport=self.viewport,
                 user_agent=self.user_agent
             )
+            self._owns_context = True
         finally:
             # La copie nettoyée porte les cookies de session : elle ne survit pas
             # à la création du contexte (Playwright la lit de façon synchrone).
