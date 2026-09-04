@@ -36,7 +36,10 @@ Incidents de scraping documentés (régressions DOM, session, MCP) :
 | Date | Incident | Fichier |
 |------|----------|---------|
 | 2026-06-25 | Feed vide — boutons Republier icône (`aria-label` only) | [post-mortem/2026-06-25-feed-repost-aria-label.md](post-mortem/2026-06-25-feed-repost-aria-label.md) |
+| 2026-07-22 | Rate limit LinkedIn et hang des actions UI (like / repost) | [post-mortem/2026-07-22-rate-limit-hang.md](post-mortem/2026-07-22-rate-limit-hang.md) |
+| 2026-08-05 | `scrape_post` renvoyait l'utilisateur de la session comme auteur | [post-mortem/2026-08-05-scrape-post-wrong-author.md](post-mortem/2026-08-05-scrape-post-wrong-author.md) |
 | 2026-09-01 | Sous-types d'invitation Showcase/Event non classifiés (jamais captés) | [post-mortem/2026-09-01-invitation-kind-showcase-event-gap.md](post-mortem/2026-09-01-invitation-kind-showcase-event-gap.md) |
+| 2026-09-03 | Cinq champs de `scrape_feed` cassés par une refonte du rendu du feed | [post-mortem/2026-09-03-feed-rendering-drift.md](post-mortem/2026-09-03-feed-rendering-drift.md) |
 
 ## Ressources
 
