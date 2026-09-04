@@ -3,6 +3,9 @@
 import asyncio
 import json
 import logging
+import os
+import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Optional, Dict, Any
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
@@ -10,6 +13,68 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from .exceptions import NetworkError
 
 logger = logging.getLogger(__name__)
+
+
+# Champs de cookie que les Playwright récents écrivent dans un storage state et que
+# les Chromium plus anciens rejettent via CDP (`Storage.setCookies: Invalid
+# parameters`), faisant échouer la création du contexte — donc tout le scraping.
+# Constaté le 2026-09-04 : session neuve refusée par le Chromium partagé du homelab
+# (zenika/alpine-chrome:124) à cause de `partitionKey` (CHIPS).
+_UNSUPPORTED_COOKIE_FIELDS = ("partitionKey",)
+
+
+def sanitize_storage_state(filepath: str) -> Path:
+    """Storage state débarrassé des champs de cookie qu'un vieux CDP refuse.
+
+    Renvoie le chemin d'origine s'il n'y a rien à nettoyer (cas courant) ou si le
+    fichier n'est pas exploitable — le nettoyage ne doit jamais faire échouer un
+    démarrage qui aurait fonctionné. Sinon, écrit une copie nettoyée dans un fichier
+    temporaire en mode 600 : le storage state contient les cookies de session.
+    """
+    path = Path(filepath)
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        cookies = state.get("cookies", [])
+    except Exception as exc:
+        logger.debug("Storage state illisible pour nettoyage (%s) : %s", path, exc)
+        return path
+
+    touched = [c for c in cookies if any(f in c for f in _UNSUPPORTED_COOKIE_FIELDS)]
+    if not touched:
+        return path
+
+    for cookie in cookies:
+        for field in _UNSUPPORTED_COOKIE_FIELDS:
+            cookie.pop(field, None)
+
+    fd, tmp = tempfile.mkstemp(prefix="linkedin_session_", suffix=".json")
+    os.close(fd)
+    tmp_path = Path(tmp)
+    tmp_path.write_text(json.dumps(state), encoding="utf-8")
+    os.chmod(tmp_path, 0o600)
+    logger.info(
+        "Storage state nettoyé : %s champ(s) de cookie non supporté(s) retiré(s) "
+        "sur %s cookies", len(touched), len(cookies),
+    )
+    return tmp_path
+
+
+def normalize_headless_user_agent(user_agent: Optional[str]) -> Optional[str]:
+    """User-agent sans le marqueur ``HeadlessChrome``.
+
+    Un Chromium lancé en ``--headless=new`` annonce
+    ``HeadlessChrome/124.0.0.0`` : c'est le signal d'automatisation le plus
+    bruyant qu'on puisse envoyer, et il a valu au compte une vérification de
+    sécurité LinkedIn le 2026-09-04 (cf. ADR-002, qui proscrit déjà le mode
+    headless pour cette raison).
+
+    On se contente de retirer le marqueur : inventer une autre version rendrait
+    l'user-agent incohérent avec le reste de l'empreinte (version du moteur,
+    client hints), ce qui est un signal plus mauvais encore.
+    """
+    if not user_agent:
+        return None
+    return user_agent.replace("HeadlessChrome/", "Chrome/")
 
 
 class BrowserManager:
@@ -74,6 +139,12 @@ class BrowserManager:
                     self.cdp_url
                 )
                 logger.info(f"Connected to existing browser via CDP: {self.cdp_url}")
+                if not self.user_agent:
+                    self.user_agent = normalize_headless_user_agent(
+                        self._probe_cdp_user_agent()
+                    )
+                    if self.user_agent:
+                        logger.info("User-agent du contexte : %s", self.user_agent)
             else:
                 self._browser = await self._playwright.chromium.launch(
                     headless=self.headless,
@@ -101,6 +172,23 @@ class BrowserManager:
             await self.close()
             raise NetworkError(f"Failed to start browser: {e}")
     
+    def _probe_cdp_user_agent(self) -> Optional[str]:
+        """User-agent annoncé par le navigateur distant, via ``/json/version``.
+
+        Best effort : un échec de sonde laisse simplement le contexte hériter de
+        l'user-agent du navigateur, comportement d'avant.
+        """
+        if not self.cdp_url:
+            return None
+        try:
+            with urllib.request.urlopen(
+                f"{self.cdp_url.rstrip('/')}/json/version", timeout=5
+            ) as resp:
+                return json.loads(resp.read().decode()).get("User-Agent")
+        except Exception as exc:
+            logger.debug("Sonde user-agent CDP en échec : %s", exc)
+            return None
+
     async def close(self) -> None:
         """Close browser and cleanup resources."""
         try:
@@ -218,11 +306,21 @@ class BrowserManager:
         if not self._browser:
             raise RuntimeError("Browser not started")
         
-        self._context = await self._browser.new_context(
-            storage_state=filepath,
-            viewport=self.viewport,
-            user_agent=self.user_agent
-        )
+        state_path = sanitize_storage_state(filepath)
+        try:
+            self._context = await self._browser.new_context(
+                storage_state=str(state_path),
+                viewport=self.viewport,
+                user_agent=self.user_agent
+            )
+        finally:
+            # La copie nettoyée porte les cookies de session : elle ne survit pas
+            # à la création du contexte (Playwright la lit de façon synchrone).
+            if state_path != Path(filepath):
+                try:
+                    os.unlink(state_path)
+                except OSError:
+                    pass
         
         # Create new page
         if self._page:
