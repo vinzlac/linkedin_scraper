@@ -120,6 +120,25 @@ async def _has_blocking_security_challenge(page: Page) -> bool:
     return False
 
 
+async def _looks_like_error_page(page: Page) -> bool:
+    """True si la page n'a pas l'ossature d'une page LinkedIn authentifiée.
+
+    Sert à cantonner la recherche de messages de limitation aux pages d'erreur :
+    une page applicative normale porte une nav et un contenu principal, et son
+    texte — celui des posts — ne doit jamais être interprété comme un signal
+    d'infrastructure.
+    """
+    try:
+        shell = await page.locator('main, nav, #global-nav').count()
+        if shell:
+            return False
+        body_text = await page.locator('body').text_content(timeout=1000) or ""
+        # Une page d'erreur LinkedIn tient en quelques lignes.
+        return len(body_text) < 2000
+    except Exception:
+        return True
+
+
 async def detect_rate_limit(page: Page) -> None:
     """
     Detect if LinkedIn has rate limited the session.
@@ -153,21 +172,33 @@ async def detect_rate_limit(page: Page) -> None:
     except Exception:
         pass
 
-    # Check for rate limit messages
+    # Message de limitation — uniquement sur une page d'ERREUR.
+    #
+    # Ces formulations sont bien trop banales pour être cherchées dans une page
+    # riche en contenu utilisateur. Constaté en production le 2026-09-06 : un
+    # post du feed vantant un crawler « with per-domain rate limits » faisait
+    # échouer le scrape, feed parfaitement chargé et session valide. La détection
+    # transformait donc du contenu légitime en panne, et enregistrait au passage
+    # 30 minutes de cooldown.
+    #
+    # On ne cherche ces phrases que si la page ne ressemble PAS à une page
+    # applicative authentifiée : une vraie limitation renvoie une page d'erreur
+    # dépouillée, sans nav ni contenu principal.
     try:
-        body_text = await page.locator('body').text_content(timeout=1000)
-        if body_text:
-            body_lower = body_text.lower()
-            if any(phrase in body_lower for phrase in [
-                'too many requests',
-                'rate limit',
-                'slow down',
-                'try again later'
-            ]):
-                _raise_rate_limit(
-                    "Rate limit message detected on page.",
-                    suggested_wait_time=1800  # 30 minutes
-                )
+        if await _looks_like_error_page(page):
+            body_text = await page.locator('body').text_content(timeout=1000)
+            if body_text:
+                body_lower = body_text.lower()
+                if any(phrase in body_lower for phrase in [
+                    'too many requests',
+                    'rate limit',
+                    'slow down',
+                    'try again later'
+                ]):
+                    _raise_rate_limit(
+                        "Rate limit message detected on page.",
+                        suggested_wait_time=1800  # 30 minutes
+                    )
     except PlaywrightTimeoutError:
         pass
 
