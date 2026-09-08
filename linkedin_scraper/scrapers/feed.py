@@ -1153,29 +1153,50 @@ class FeedScraper(BaseScraper):
                     });
                 }
                 // Le nouveau rendu (CSS atomisé) n'expose plus les classes
-                // .comments-comment-item ni les [data-id] : chaque commentaire porte
-                // un componentkey `replaceableComment_urn:li:comment:(...)`. Sans ces
-                // deux ancres, `comments` et `top_comment` restaient vides même avec
-                // des commentaires affichés.
-                var commentSelectors = [
+                // .comments-comment-item ni les [data-id] sur le feed : chaque
+                // commentaire y porte un componentkey `replaceableComment_…`. Les
+                // pages de détail d'un post, elles, utilisent encore les classes.
+                //
+                // Deux familles distinctes, et c'est ce qui compte : PRIMAIRES désigne
+                // un commentaire entier, REPLI désigne un fragment (corps seul) ou un
+                // conteneur. Mélanger les deux fait hériter les liens d'un commentaire
+                // de l'auteur d'un autre — relevé en live le 2026-09-08 : trois liens
+                // de profils distincts, tous attribués à la même personne.
+                var commentSelectorsPrimary = [
                     '[componentkey^="replaceableComment_"]',
-                    '[componentkey^="commentsSectionContainer"]',
                     '.comments-comment-item',
-                    '[data-id^="urn:li:comment"]',
+                    '[data-id^="urn:li:comment"]'
+                ];
+                var commentSelectorsFallback = [
+                    '[componentkey^="commentsSectionContainer"]',
                     '.comments-comment-item-content-body',
                     '.comments-comment-item__main-content'
                 ];
-                var commentNodes = [];
-                for (var cs = 0; cs < commentSelectors.length; cs++) {
-                    var found = el.querySelectorAll(commentSelectors[cs]);
-                    for (var fi = 0; fi < found.length; fi++) commentNodes.push(found[fi]);
+                function collectCommentNodes(selectors) {
+                    var acc = [];
+                    for (var cs = 0; cs < selectors.length; cs++) {
+                        var found = el.querySelectorAll(selectors[cs]);
+                        for (var fi = 0; fi < found.length; fi++) acc.push(found[fi]);
+                    }
+                    // Un nœud qui en contient un autre du même rang est un conteneur,
+                    // pas un commentaire : on ne garde que les plus internes.
+                    return acc.filter(function (node, idx) {
+                        if (acc.indexOf(node) !== idx) return false;
+                        for (var k = 0; k < acc.length; k++) {
+                            if (acc[k] !== node && node.contains(acc[k])) return false;
+                        }
+                        return true;
+                    });
                 }
+                var commentNodes = collectCommentNodes(commentSelectorsPrimary);
+                if (!commentNodes.length) {
+                    commentNodes = collectCommentNodes(commentSelectorsFallback);
+                }
+
                 for (var ci = 0; ci < commentNodes.length; ci++) {
                     var cnode = commentNodes[ci];
                     var ctext = (cnode.innerText || "").trim().slice(0, 2000);
-                    var cauthor = "";
-                    var authorEl = cnode.querySelector('.comments-post-meta__name-text, .comments-post-meta__name, a[href*="/in/"]');
-                    if (authorEl) cauthor = (authorEl.innerText || "").trim().slice(0, 120);
+                    var cauthor = commentAuthorFromNode(cnode);
 
                     var cLinks = cnode.querySelectorAll("a[href]");
                     for (var cli = 0; cli < cLinks.length; cli++) {
@@ -1202,6 +1223,41 @@ class FeedScraper(BaseScraper):
                 // atomis\u00e9 : on le d\u00e9limite comme pour le post lui-m\u00eame, en partant de
                 // l'horodatage (l'en-t\u00eate — nom, badge, degr\u00e9, accroche — le pr\u00e9c\u00e8de)
                 // et en s'arr\u00eatant \u00e0 la premi\u00e8re ligne d'action ou de compteur.
+                // Nom de l'auteur d'un commentaire.
+                //
+                // LinkedIn a renomm\u00e9 `comments-post-meta__*` en
+                // `comments-comment-meta__*` : le code cherchait les anciennes
+                // classes et retombait sur la premi\u00e8re ancre `/in/` du bloc, qui
+                // est celle de l'avatar et n'a pas de texte. D'o\u00f9 un auteur
+                // toujours vide, et un consommateur oblig\u00e9 de reconstruire
+                // \u00ab Auteur \u2014 texte \u00bb \u00e0 la main.
+                function cleanCommentAuthor(raw) {
+                    return (raw || "").split("\\n")[0]
+                        .replace(/\\s*[\u2022\u00b7]\\s*(\\d+e(\\s+et\\s+\\+)?|1er|Suivi|Following)[\\s\\S]*$/i, "")
+                        .replace(/\\s*(V\u00e9rifi\u00e9|Verified|Premium|Auteur|Author)\\s*$/i, "")
+                        .trim();
+                }
+                function commentAuthorFromNode(node) {
+                    var named = node.querySelectorAll(
+                        '.comments-comment-meta__description-title, ' +
+                        '.comments-comment-meta__description-container, ' +
+                        '.comments-post-meta__name-text, .comments-post-meta__name'
+                    );
+                    for (var i = 0; i < named.length; i++) {
+                        var n1 = cleanCommentAuthor(named[i].innerText || "");
+                        if (n1.length > 1) return n1.slice(0, 120);
+                    }
+                    // Repli : la premi\u00e8re ancre de profil PORTANT du texte — l'ancre
+                    // de l'avatar, vide, doit \u00eatre ignor\u00e9e.
+                    var links = node.querySelectorAll("a[href*='/in/']");
+                    for (var j = 0; j < links.length; j++) {
+                        var sp = links[j].querySelector("span[aria-hidden='true']");
+                        var n2 = cleanCommentAuthor((sp ? sp.innerText : links[j].innerText) || "");
+                        if (n2.length > 1) return n2.slice(0, 120);
+                    }
+                    return "";
+                }
+
                 function commentBodyFromNode(node) {
                     var bodyEl = node.querySelector(
                         '.comments-comment-item-content-body, .update-components-text, ' +
@@ -1239,9 +1295,13 @@ class FeedScraper(BaseScraper):
                 }
 
                 var topComment = "";
+                var topCommentAuthor = "";
                 for (var tc = 0; tc < commentNodes.length && !topComment; tc++) {
                     var rawTop = commentBodyFromNode(commentNodes[tc]);
-                    if (rawTop) topComment = rawTop.slice(0, 2000);
+                    if (rawTop) {
+                        topComment = rawTop.slice(0, 2000);
+                        topCommentAuthor = commentAuthorFromNode(commentNodes[tc]);
+                    }
                 }
 
                 if (!permalinkUrl) {
@@ -1266,6 +1326,7 @@ class FeedScraper(BaseScraper):
                     repostsText: repostsText,
                     comments: comments,
                     topComment: topComment,
+                    topCommentAuthor: topCommentAuthor,
                     images: images,
                     videoUrl: videoUrl,
                     externalUrl: externalUrl,
@@ -1331,6 +1392,7 @@ class FeedScraper(BaseScraper):
                 urn=urn,
                 feed_compkey=feed_compkey,
                 top_comment=self._clean_comment_text(data.get("topComment")),
+                top_comment_author=(data.get("topCommentAuthor") or None),
                 identifier_candidates=data.get("identifierCandidates", []),
                 permalink_candidates=permalink_candidates,
                 component_keys=data.get("componentKeys", []),
