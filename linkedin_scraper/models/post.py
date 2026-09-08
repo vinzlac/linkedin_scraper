@@ -28,6 +28,7 @@ class Post(BaseModel):
     # du premier commentaire visible, sans filtre.
     comments: List[Dict[str, Any]] = Field(default_factory=list)
     top_comment: Optional[str] = None
+    top_comment_author: Optional[str] = None
     # Extra debug/trace fields for difficult feed cards (compkey, repost wrappers, A/B layouts)
     identifier_candidates: List[str] = Field(default_factory=list)
     permalink_candidates: List[str] = Field(default_factory=list)

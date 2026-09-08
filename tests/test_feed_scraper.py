@@ -820,6 +820,137 @@ class TestCommentExpansionBudget:
         assert second == 0, "fil déjà ouvert : ne pas recliquer"
 
 
+
+
+class TestCommentAuthorDom:
+    """Auteur des commentaires — manquant depuis la refonte de septembre 2026.
+
+    Relevé sur une vraie page post le 2026-09-08 : LinkedIn a renommé les classes
+    `comments-post-meta__*` en `comments-comment-meta__*`. Le code cherchait les
+    anciennes, et son repli `a[href*="/in/"]` tombait sur l'ancre de l'avatar —
+    vide — d'où un `authorName` toujours nul.
+
+    Conséquence côté consommateur (tâche planifiée linkedin-feed-11h du
+    2026-09-08) : le format « Auteur — texte » du Top Comment devait être
+    reconstruit à la main, faute d'auteur structuré.
+    """
+
+    COMMENT_HTML = """
+    <html><body>
+      <div>
+        <div><a href="/in/someone/">Someone</a></div>
+        <div><a href="/feed/update/urn:li:activity:7501269181053513728/">2 h</a></div>
+        <div>Contenu du post de test, suffisamment long pour passer les filtres.</div>
+        <div><button>J&rsquo;aime</button></div>
+        <div><button>Commenter</button></div>
+        <div><button>Republier</button></div>
+        <div class="comments-comment-item">
+          <div class="comments-comment-meta__container">
+            <a class="comments-comment-meta__image-link" href="/in/prakhar-rampalli/"></a>
+            <a class="comments-comment-meta__description-container" href="/in/prakhar-rampalli/">
+              Prakhar Rampalli
+            </a>
+            <div>&bull; 3e et +</div>
+            <div>Software Engineer | AI Retrieval Systems</div>
+            <div>4 j</div>
+          </div>
+          <div>This is an important distinction: retrieval and reranking solve
+          different problems.</div>
+        </div>
+      </div>
+    </body></html>
+    """
+
+    @pytest.mark.asyncio
+    async def test_extracts_the_comment_author(self):
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(self.COMMENT_HTML)
+                scraper = FeedScraper(page)
+                posts = await scraper._extract_posts_from_feed()
+            finally:
+                await browser.close()
+
+        assert len(posts) == 1
+        post = posts[0]
+        # L'ancre de l'avatar, vide, ne doit pas être prise pour l'auteur.
+        assert post.top_comment_author == "Prakhar Rampalli", post.top_comment_author
+        assert post.top_comment and "retrieval and reranking" in post.top_comment
+
+    @pytest.mark.asyncio
+    async def test_strips_the_degree_suffix_from_the_name(self):
+        from playwright.async_api import async_playwright
+
+        html = self.COMMENT_HTML.replace(
+            "Prakhar Rampalli\n            </a>",
+            "Prakhar Rampalli &bull; 3e et +</a>",
+        )
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                posts = await FeedScraper(page)._extract_posts_from_feed()
+            finally:
+                await browser.close()
+
+        assert posts[0].top_comment_author == "Prakhar Rampalli", posts[0].top_comment_author
+
+
+    @pytest.mark.asyncio
+    async def test_does_not_attribute_a_comment_to_another_author(self):
+        """Les sélecteurs de commentaires se recouvrent (un conteneur et ses
+        enfants matchent tous les deux). Sans dédoublonnage, les liens d'un
+        commentaire héritaient de l'auteur du premier — constaté en live le
+        2026-09-08 : trois liens de profils distincts, tous attribués à la même
+        personne."""
+        from playwright.async_api import async_playwright
+
+        html = """
+        <html><body>
+          <div>
+            <div><a href="/in/someone/">Someone</a></div>
+            <div><a href="/feed/update/urn:li:activity:7501269181053513728/">2 h</a></div>
+            <div>Contenu du post de test, assez long pour passer les filtres.</div>
+            <div><button>J&rsquo;aime</button></div>
+            <div><button>Republier</button></div>
+            <div componentkey="commentsSectionContainerXYZ">
+              <div class="comments-comment-item">
+                <a class="comments-comment-meta__description-container" href="/in/alice/">Alice</a>
+                <div>3 h</div>
+                <div>Premier commentaire <a href="https://example.com/alice">lien d'Alice</a></div>
+              </div>
+              <div class="comments-comment-item">
+                <a class="comments-comment-meta__description-container" href="/in/bob/">Bob</a>
+                <div>2 h</div>
+                <div>Second commentaire <a href="https://example.com/bob">lien de Bob</a></div>
+              </div>
+            </div>
+          </div>
+        </body></html>
+        """
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.set_content(html)
+                posts = await FeedScraper(page)._extract_posts_from_feed()
+            finally:
+                await browser.close()
+
+        entrees = [(c["author_name"], c["url"]) for c in posts[0].comments]
+        # Une seule entrée par lien : le conteneur ne doit pas produire un doublon
+        # attribué au mauvais auteur.
+        urls = [u for _, u in entrees]
+        assert len(urls) == len(set(urls)), f"liens dupliqués : {entrees}"
+        assert ("Alice", "https://example.com/alice") in entrees, entrees
+        assert ("Bob", "https://example.com/bob") in entrees, entrees
+
+
 # ---------------------------------------------------------------------------
 # Integration tests (require a real LinkedIn session)
 # ---------------------------------------------------------------------------
