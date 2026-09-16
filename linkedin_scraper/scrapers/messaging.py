@@ -15,6 +15,34 @@ from ..callbacks import ProgressCallback, SilentCallback
 from ..core.exceptions import ScrapingError
 from ..models.conversation import Conversation
 from ..models.message import Message, MessageDirection
+
+_PROFILE_ID_IN_URL_RE = re.compile(r"/in/([A-Za-z0-9_-]+)")
+_OWNER_ID_IN_EVENT_URN_RE = re.compile(r"urn:li:fsd_profile:([A-Za-z0-9_-]+)")
+
+
+def resolve_message_direction(
+    classes: str, sender_url: Optional[str], event_urn: Optional[str]
+) -> MessageDirection:
+    """Direction d'un message du thread DOM.
+
+    Les classes ``msg-s-event-listitem--other`` / ``--self`` restent prioritaires,
+    mais LinkedIn n'émet plus ``--self`` sur les messages du compte (issue #13) :
+    on retombe alors sur l'id de profil de l'expéditeur (``sender_url``) comparé
+    à l'id du compte, que LinkedIn embarque dans chaque ``data-event-urn``
+    (``urn:li:msg_message:(urn:li:fsd_profile:<compte>,…)``) — aucun appel
+    réseau nécessaire. ``unknown`` ne reste que sans signal exploitable.
+    """
+    if "msg-s-event-listitem--other" in classes:
+        return "inbound"
+    if "msg-s-event-listitem--self" in classes:
+        return "outbound"
+    if not sender_url or not event_urn:
+        return "unknown"
+    owner = _OWNER_ID_IN_EVENT_URN_RE.search(event_urn)
+    sender = _PROFILE_ID_IN_URL_RE.search(sender_url)
+    if not owner or not sender:
+        return "unknown"
+    return "outbound" if sender.group(1) == owner.group(1) else "inbound"
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -861,11 +889,7 @@ class MessagingScraper(BaseScraper):
                 or None
             )
 
-        direction: MessageDirection = "unknown"
-        if "msg-s-event-listitem--other" in classes:
-            direction = "inbound"
-        elif "msg-s-event-listitem--self" in classes:
-            direction = "outbound"
+        direction = resolve_message_direction(classes, sender_url, urn)
 
         return Message(
             conversation_id=conversation_id,
