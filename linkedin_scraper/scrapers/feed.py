@@ -150,6 +150,8 @@ class FeedScraper(BaseScraper):
         self._comment_expand_budget = _MAX_COMMENT_EXPAND_CLICKS_PER_SCRAPE
         # Session de fil (R56) : clés des posts déjà rendus par `scrape_next`.
         self._returned_keys: Set[str] = set()
+        # Cartes déjà passées par le repli UI des permaliens, réussi ou non.
+        self._ui_fallback_attempted: Set[str] = set()
 
     def _reset_comment_expand_budget(self) -> None:
         """Rend son budget de clics d'ouverture de commentaires à un nouveau scrape."""
@@ -1662,10 +1664,19 @@ class FeedScraper(BaseScraper):
                 data["uiPermalinkFallbackStatus"] = "resolved_via_cache"
                 continue
 
+            # Une seule tentative par carte et par instance : chaque passe de
+            # défilement rappelle ce repli, et le clic sur le menu ramène la page
+            # sur la carte — retenter une carte rebelle bloque le défilement et
+            # répète un geste d'automatisation (essai réel du 2026-10-05).
+            if urn and urn in self._ui_fallback_attempted:
+                data["uiPermalinkFallbackStatus"] = "skipped_already_attempted"
+                continue
             if ui_fallback_attempts >= _MAX_UI_FALLBACK_PER_CALL:
                 data["uiPermalinkFallbackStatus"] = "skipped_cap_reached"
                 continue
             ui_fallback_attempts += 1
+            if urn:
+                self._ui_fallback_attempted.add(urn)
 
             data["uiPermalinkFallbackStatus"] = "no_permalink_found"
             errors: List[str] = []

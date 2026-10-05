@@ -1183,6 +1183,26 @@ class TestFeedScraperSession:
         scraper.page.locator.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_pas_de_second_repli_ui_pour_une_carte_deja_tentee(self):
+        # Essai réel du 2026-10-05 : une carte sans permalien a vu son menu
+        # rouvert à chaque passe (~25 fois en 1 min 30) ; chaque clic ramenait
+        # la page sur la carte, le fil n'avançait plus et le lot finissait
+        # « épuisé » à tort.
+        scraper = self._make_scraper()
+        introuvable = MagicMock()
+        introuvable.count = AsyncMock(return_value=0)
+        scraper.page.locator = MagicMock(return_value=MagicMock(first=introuvable))
+        carte = {"urn": "urn:li:compkey:rebelle", "componentKeys": ["x" * 20]}
+        with patch("linkedin_scraper.scrapers.feed.get_cached_permalink", return_value=None):
+            await scraper._fill_missing_permalinks_from_ui([dict(carte)])
+            appels = scraper.page.locator.call_count
+            out = await scraper._fill_missing_permalinks_from_ui([dict(carte)])
+
+        assert appels > 0
+        assert out[0]["uiPermalinkFallbackStatus"] == "skipped_already_attempted"
+        assert scraper.page.locator.call_count == appels
+
+    @pytest.mark.asyncio
     async def test_scrape_delegue_le_chargement_a_open_feed(self):
         scraper = self._make_scraper()
         with patch.object(scraper, "open_feed", new=AsyncMock(return_value=False)) as ouvrir:
