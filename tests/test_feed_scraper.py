@@ -1018,3 +1018,175 @@ class TestFeedScraperIntegration:
             )
         assert "martignole" in author or "nicolas" in author
 
+
+
+class TestFeedScraperSession:
+    """Sessions de fil (spec lots de scraping, R55-R56) : la suite ne recharge
+    jamais le fil et ne rend jamais deux fois le même post."""
+
+    def _make_scraper(self):
+        page = MagicMock()
+        page.evaluate = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.goto = AsyncMock()
+        page.bring_to_front = AsyncMock()
+        page.url = "https://www.linkedin.com/feed/"
+        return FeedScraper(page)
+
+    @staticmethod
+    def _post(n, urn=None, compkey=None):
+        return Post(
+            urn=urn or f"urn:li:activity:{7000000000000000000 + n}",
+            feed_compkey=compkey,
+            linkedin_url=f"https://www.linkedin.com/feed/update/urn:li:activity:{7000000000000000000 + n}/",
+            author_name=f"Auteur {n}",
+            text=f"Post {n}",
+        )
+
+    def _feed(self, scraper, batches):
+        """Chaque passe d'extraction rend toutes les cartes présentes dans le
+        DOM, comme en vrai : on simule un DOM qui grandit à chaque défilement."""
+        state = {"i": 0}
+
+        async def extract():
+            return batches[min(state["i"], len(batches) - 1)]
+
+        async def scroll():
+            state["i"] += 1
+
+        return (
+            patch.object(scraper, "_extract_posts_from_feed", side_effect=extract),
+            patch.object(scraper, "_scroll_for_more_posts", side_effect=scroll),
+            patch.object(scraper, "check_rate_limit", new=AsyncMock()),
+            patch("linkedin_scraper.scrapers.feed.check_cooldown"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_rend_les_posts_suivants_sans_naviguer(self):
+        scraper = self._make_scraper()
+        p = [self._post(i) for i in range(1, 7)]
+        dom = [p[:3], p[:5], p[:6], p[:6]]
+        e, s, r, c = self._feed(scraper, dom)
+        with e, s, r, c:
+            premiers, _ = await scraper.scrape_next(limit=3)
+            suivants, _ = await scraper.scrape_next(limit=3)
+
+        assert [x.author_name for x in premiers] == ["Auteur 1", "Auteur 2", "Auteur 3"]
+        assert [x.author_name for x in suivants] == ["Auteur 4", "Auteur 5", "Auteur 6"]
+        scraper.page.goto.assert_not_called()
+        # Onglet d'arrière-plan gelé par Chrome (af51454) : remis au premier plan.
+        scraper.page.bring_to_front.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_ne_rend_pas_deux_fois_une_carte_dont_l_urn_change(self):
+        # Une carte peut sortir d'abord avec son compkey (permalien non résolu,
+        # plafond d'UI atteint), puis avec son URN d'activité au défilement
+        # suivant. La clé « déjà rendu » couvre les deux identifiants.
+        scraper = self._make_scraper()
+        # Une carte compkey non résolue n'a pas de permalien (feed.py:2079) :
+        # seule la clé `feed_compkey` relie les deux apparitions.
+        vu_en_compkey = Post(
+            urn="urn:li:compkey:abc", feed_compkey="urn:li:compkey:abc",
+            linkedin_url=None, author_name="Auteur 1", text="Post 1",
+        )
+        meme_carte_resolue = self._post(1, compkey="urn:li:compkey:abc")
+        autre = self._post(2)
+        e, s, r, c = self._feed(scraper, [[vu_en_compkey], [meme_carte_resolue, autre], [meme_carte_resolue, autre]])
+        with e, s, r, c:
+            premier, _ = await scraper.scrape_next(limit=1)
+            second, _ = await scraper.scrape_next(limit=5)
+
+        assert [x.author_name for x in premier] == ["Auteur 1"]
+        assert [x.author_name for x in second] == ["Auteur 2"]
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_signale_un_fil_epuise(self):
+        scraper = self._make_scraper()
+        p = [self._post(i) for i in range(1, 3)]
+        e, s, r, c = self._feed(scraper, [p, p])
+        with e, s, r, c:
+            posts, exhausted = await scraper.scrape_next(limit=5)
+
+        assert len(posts) == 2
+        assert exhausted is True
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_n_est_pas_epuise_quand_la_limite_est_atteinte(self):
+        scraper = self._make_scraper()
+        p = [self._post(i) for i in range(1, 4)]
+        e, s, r, c = self._feed(scraper, [p])
+        with e, s, r, c:
+            posts, exhausted = await scraper.scrape_next(limit=3)
+
+        assert len(posts) == 3
+        assert exhausted is False
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_n_enrichit_pas_les_commentaires_par_navigation(self):
+        # `_enrich_missing_comments_from_post_page` recharge le fil au retour :
+        # dans une session, il ferait perdre la position.
+        scraper = self._make_scraper()
+        e, s, r, c = self._feed(scraper, [[self._post(1)]])
+        with e, s, r, c, patch.object(
+            scraper, "_enrich_missing_comments_from_post_page", new=AsyncMock()
+        ) as enrich:
+            await scraper.scrape_next(limit=1)
+
+        enrich.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_verifie_la_limitation_a_chaque_appel(self):
+        scraper = self._make_scraper()
+        e, s, r, c = self._feed(scraper, [[self._post(1)], [self._post(1), self._post(2)]])
+        with e, s, r as rate, c as cooldown:
+            await scraper.scrape_next(limit=1)
+            await scraper.scrape_next(limit=1)
+
+        assert rate.await_count == 2
+        assert cooldown.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_rend_son_budget_de_commentaires_a_chaque_appel(self):
+        scraper = self._make_scraper()
+        scraper._comment_expand_budget = 0
+        e, s, r, c = self._feed(scraper, [[self._post(1)]])
+        with e, s, r, c:
+            await scraper.scrape_next(limit=1)
+
+        assert scraper._comment_expand_budget > 0
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_verifie_la_connexion_si_l_onglet_a_ete_redirige(self):
+        # LinkedIn peut rediriger l'onglet de session (login, challenge) entre
+        # deux appels ; sans ce contrôle, on défilerait une page de login et on
+        # conclurait à tort que le fil est épuisé.
+        scraper = self._make_scraper()
+        scraper.page.url = "https://www.linkedin.com/login"
+        e, s, r, c = self._feed(scraper, [[self._post(1)]])
+        with e, s, r, c, patch.object(scraper, "ensure_logged_in", new=AsyncMock()) as connexion:
+            await scraper.scrape_next(limit=1)
+
+        connexion.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_pas_de_repli_ui_pour_une_carte_deja_rendue(self):
+        # R61 — sans ce garde, chaque passe de chaque lot rouvrirait le menu des
+        # vieilles cartes non résolues du haut du fil et affamerait les nouvelles.
+        scraper = self._make_scraper()
+        scraper._returned_keys = {"urn:li:compkey:deja"}
+        scraper.page.locator = MagicMock()
+        with patch("linkedin_scraper.scrapers.feed.get_cached_permalink", return_value=None):
+            out = await scraper._fill_missing_permalinks_from_ui(
+                [{"urn": "urn:li:compkey:deja", "componentKeys": ["x" * 20]}]
+            )
+        assert out[0]["uiPermalinkFallbackStatus"] == "skipped_already_returned"
+        scraper.page.locator.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_scrape_delegue_le_chargement_a_open_feed(self):
+        scraper = self._make_scraper()
+        with patch.object(scraper, "open_feed", new=AsyncMock(return_value=False)) as ouvrir:
+            posts = await scraper.scrape(limit=3)
+
+        ouvrir.assert_awaited_once()
+        assert posts == []

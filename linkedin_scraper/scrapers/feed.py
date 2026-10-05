@@ -1,12 +1,13 @@
 import logging
 import re
 from urllib.parse import urlparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
 from ..models.post import Post
 from ..callbacks import ProgressCallback, SilentCallback
 from ..core import get_cached_permalink, save_cached_permalink
+from ..core.rate_limit_guard import check_cooldown
 from .base import BaseScraper
 
 logger = logging.getLogger(__name__)
@@ -133,21 +134,32 @@ _EXPAND_COMMENTS_JS = r"""
 }
 """
 
+def _post_keys(post: Post) -> Set[str]:
+    """Identifiants sous lesquels une carte a pu être rendue.
+
+    Une même carte peut sortir avec son compkey tant que son permalien n'est
+    pas résolu, puis avec son URN d'activité au défilement suivant : la
+    mémoire « déjà rendu » d'une session de fil doit couvrir les trois."""
+    return {k for k in (post.urn, post.feed_compkey, post.linkedin_url) if k}
+
+
 class FeedScraper(BaseScraper):
 
     def __init__(self, page: Page, callback: Optional[ProgressCallback] = None):
         super().__init__(page, callback or SilentCallback())
         self._comment_expand_budget = _MAX_COMMENT_EXPAND_CLICKS_PER_SCRAPE
+        # Session de fil (R56) : clés des posts déjà rendus par `scrape_next`.
+        self._returned_keys: Set[str] = set()
 
     def _reset_comment_expand_budget(self) -> None:
         """Rend son budget de clics d'ouverture de commentaires à un nouveau scrape."""
         self._comment_expand_budget = _MAX_COMMENT_EXPAND_CLICKS_PER_SCRAPE
 
-    async def scrape(self, limit: int = 10) -> List[Post]:
-        logger.info(f"Starting feed scraping (limit={limit})")
-        self._reset_comment_expand_budget()
-        await self.callback.on_start("feed", FEED_URL)
+    async def open_feed(self) -> bool:
+        """Charge le fil et attend qu'au moins un post soit rendu.
 
+        Partagé par `scrape()` et par l'ouverture d'une session de fil
+        (`linkedin-mcp`, R55). Rend `False` si le fil ne s'est pas chargé."""
         await self.navigate_and_wait(FEED_URL)
         await self.callback.on_progress("Navigated to feed", 10)
         await self.ensure_logged_in()
@@ -181,10 +193,19 @@ class FeedScraper(BaseScraper):
                 diag.get("title"),
                 diag.get("buttons"),
             )
-            return []
+            return False
 
         await self.page.wait_for_timeout(2000)
         await self.callback.on_progress("Feed loaded", 20)
+        return True
+
+    async def scrape(self, limit: int = 10) -> List[Post]:
+        logger.info(f"Starting feed scraping (limit={limit})")
+        self._reset_comment_expand_budget()
+        await self.callback.on_start("feed", FEED_URL)
+
+        if not await self.open_feed():
+            return []
 
         posts = await self._scrape_posts(limit)
         posts = await self._enrich_missing_comments_from_post_page(posts)
@@ -193,6 +214,37 @@ class FeedScraper(BaseScraper):
 
         logger.info(f"Successfully scraped {len(posts)} posts from feed")
         return posts
+
+    async def scrape_next(self, limit: int = 10) -> Tuple[List[Post], bool]:
+        """Suite d'une session de fil (R56) : défile depuis la position
+        courante, sans jamais naviguer, et rend au plus `limit` posts jamais
+        rendus par cette instance.
+
+        Ni `goto`, ni enrichissement des commentaires par page de post : ce
+        dernier recharge le fil au retour et ferait perdre la position.
+        Rend `(posts, exhausted)` ; `exhausted` vaut vrai quand le plafond de
+        défilements est atteint avant `limit` posts."""
+        # Un onglet d'arrière-plan est gelé par Chrome (af51454) : sans premier
+        # plan, ni le défilement ni le lazy-loading ne répondent.
+        try:
+            await self.page.bring_to_front()
+        except Exception:
+            pass
+        check_cooldown()
+        await self.check_rate_limit()
+        if "linkedin.com/feed" not in (getattr(self.page, "url", "") or ""):
+            # LinkedIn a pu rediriger l'onglet de session (login, challenge).
+            await self.ensure_logged_in()
+        self._reset_comment_expand_budget()
+        posts, exhausted = await self._collect_posts(limit, self._returned_keys)
+        if exhausted:
+            # Une page de challenge apparue en cours de défilement ressemble à
+            # un fil vide : la reconnaître plutôt que conclure à l'épuisement.
+            await self.check_rate_limit()
+        for post in posts:
+            self._returned_keys |= _post_keys(post)
+        logger.info(f"Session de fil : {len(posts)} post(s) rendu(s), épuisé={exhausted}")
+        return posts, exhausted
 
     async def scrape_post_by_url(self, post_url: str) -> List[Post]:
         """Scrape un post LinkedIn précis depuis son URL /feed/update/ ou /posts/."""
@@ -402,6 +454,10 @@ class FeedScraper(BaseScraper):
         }
 
     async def _scrape_posts(self, limit: int) -> List[Post]:
+        posts, _ = await self._collect_posts(limit, set())
+        return posts
+
+    async def _collect_posts(self, limit: int, exclude: Set[str]) -> Tuple[List[Post], bool]:
         posts: List[Post] = []
         scroll_attempts = 0
         max_scrolls = limit * 3 + 10
@@ -410,16 +466,19 @@ class FeedScraper(BaseScraper):
             new_posts = await self._extract_posts_from_feed()
 
             for post in new_posts:
-                if post.urn and not any(p.urn == post.urn for p in posts):
-                    posts.append(post)
-                    if len(posts) >= limit:
-                        break
+                if not post.urn or _post_keys(post) & exclude:
+                    continue
+                if any(p.urn == post.urn for p in posts):
+                    continue
+                posts.append(post)
+                if len(posts) >= limit:
+                    break
 
             if len(posts) < limit:
                 await self._scroll_for_more_posts()
                 scroll_attempts += 1
 
-        return posts[:limit]
+        return posts[:limit], len(posts) < limit
 
     async def _extract_posts_from_feed(self) -> List[Post]:
         await self._expand_visible_comments_for_url_scrape()
@@ -1576,6 +1635,11 @@ class FeedScraper(BaseScraper):
                 continue
 
             urn = data.get("urn") or ""
+            # R61 — une carte déjà rendue par la session n'a plus besoin de
+            # permalien ici ; sans ce garde, chaque passe rouvrirait son menu.
+            if urn and urn in self._returned_keys:
+                data["uiPermalinkFallbackStatus"] = "skipped_already_returned"
+                continue
             cached = get_cached_permalink(urn)
             if cached:
                 data["permalinkUrl"] = cached
