@@ -1190,3 +1190,47 @@ class TestFeedScraperSession:
 
         ouvrir.assert_awaited_once()
         assert posts == []
+
+    @pytest.mark.asyncio
+    async def test_scrape_next_ne_rend_pas_deux_fois_une_carte_dans_un_meme_lot(self):
+        # R56 — une carte compkey non résolue à la passe 1 est résolue à la
+        # passe 2 sous son URN d'activité : le lot ne doit la contenir qu'une fois.
+        scraper = self._make_scraper()
+        vu_en_compkey = Post(
+            urn="urn:li:compkey:abc", feed_compkey="urn:li:compkey:abc",
+            linkedin_url=None, author_name="Auteur 1", text="Post 1",
+        )
+        meme_carte_resolue = self._post(1, compkey="urn:li:compkey:abc")
+        autre = self._post(2)
+        e, s, r, c = self._feed(scraper, [[vu_en_compkey], [meme_carte_resolue, autre]])
+        with e, s, r, c:
+            posts, _ = await scraper.scrape_next(limit=3)
+
+        assert [x.author_name for x in posts] == ["Auteur 1", "Auteur 2"]
+
+    @pytest.mark.asyncio
+    async def test_extraction_ne_resout_pas_les_liens_d_une_carte_deja_rendue(self):
+        # Anti-détection — en session, chaque passe reconstruirait toutes les
+        # cartes du DOM et re-résoudrait leurs liens (requêtes avec cookies) :
+        # le volume croîtrait avec l'index du lot.
+        scraper = self._make_scraper()
+        scraper._returned_keys = {"urn:li:activity:111"}
+        scraper.page.request = MagicMock()
+        scraper.page.request.get = AsyncMock(
+            side_effect=lambda url, **kw: MagicMock(url=url, dispose=AsyncMock())
+        )
+
+        def card(urn):
+            return {
+                "urn": urn, "permalinkUrl": None, "authorName": urn,
+                "externalUrl": f"https://lnkd.in/{urn[-3:]}",
+            }
+
+        scraper.page.evaluate = AsyncMock(
+            return_value=[card("urn:li:activity:111"), card("urn:li:activity:222")]
+        )
+        with patch.object(scraper, "_expand_visible_comments_for_url_scrape", new=AsyncMock()):
+            posts = await scraper._extract_posts_from_feed()
+
+        assert [p.urn for p in posts] == ["urn:li:activity:222"]
+        assert scraper.page.request.get.await_count == 1

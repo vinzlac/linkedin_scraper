@@ -459,6 +459,7 @@ class FeedScraper(BaseScraper):
 
     async def _collect_posts(self, limit: int, exclude: Set[str]) -> Tuple[List[Post], bool]:
         posts: List[Post] = []
+        seen: Set[str] = set()
         scroll_attempts = 0
         max_scrolls = limit * 3 + 10
 
@@ -466,11 +467,15 @@ class FeedScraper(BaseScraper):
             new_posts = await self._extract_posts_from_feed()
 
             for post in new_posts:
-                if not post.urn or _post_keys(post) & exclude:
+                if not post.urn:
                     continue
-                if any(p.urn == post.urn for p in posts):
+                keys = _post_keys(post)
+                # R56 — une carte compkey non résolue à une passe peut sortir
+                # sous son URN d'activité à la suivante, dans le même lot.
+                if keys & (exclude | seen):
                     continue
                 posts.append(post)
+                seen |= keys
                 if len(posts) >= limit:
                     break
 
@@ -1394,6 +1399,14 @@ class FeedScraper(BaseScraper):
 
             return results;
         }""")
+        # Anti-détection : en session, les cartes déjà rendues restent dans le DOM ;
+        # les reconstruire re-résoudrait leurs liens (requêtes avec cookies) et le
+        # volume par appel croîtrait avec l'index du lot. On les écarte d'emblée.
+        if self._returned_keys:
+            posts_data = [
+                d for d in posts_data
+                if not ({d.get("urn"), d.get("permalinkUrl")} & self._returned_keys)
+            ]
         posts_data = await self._fill_missing_permalinks_from_ui(posts_data)
 
         result: List[Post] = []
