@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "linkedin-playwright-scraper"
-version = "4.5.1"
+version = "4.6.0"
 description = "Async LinkedIn scraper for profiles, companies, jobs and feed — Playwright-based"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -28,7 +28,7 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "playwright>=1.40.0",
+    "playwright>=1.43.0",
     "requests>=2.31.0",
     "lxml>=5.0.0",
     "pydantic>=2.0.0",

@@ -1048,7 +1048,7 @@ wheels = [
 
 [[package]]
 name = "linkedin-playwright-scraper"
-version = "4.5.1"
+version = "4.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiofiles" },
@@ -1078,7 +1078,7 @@ dev = [
 requires-dist = [
     { name = "aiofiles", specifier = ">=23.0.0" },
     { name = "lxml", specifier = ">=5.0.0" },
-    { name = "playwright", specifier = ">=1.40.0" },
+    { name = "playwright", specifier = ">=1.43.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "requests", specifier = ">=2.31.0" },
