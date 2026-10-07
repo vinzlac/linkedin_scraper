@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -13,6 +15,12 @@ from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 from .exceptions import NetworkError
 
 logger = logging.getLogger(__name__)
+
+SESSION_COOKIE = "li_at"
+"""Cookie qui porte l'authentification LinkedIn : sa présence fait foi."""
+
+_LINKEDIN_COOKIE_DOMAIN = re.compile(r"(^|\.)linkedin\.com$")
+_LINKEDIN_URL = "https://www.linkedin.com"
 
 
 # Champs de cookie que les Playwright récents écrivent dans un storage state et que
@@ -150,6 +158,9 @@ class BrowserManager:
         # False quand la page préexistait dans le profil du navigateur distant.
         self._owns_page = True
         self._is_authenticated = False
+        # True si le dernier load_session() a injecté le fichier de session dans
+        # le profil persistant (profil sans session, ou force=True).
+        self.session_seeded = False
     
     async def __aenter__(self) -> "BrowserManager":
         """Start browser and create context."""
@@ -368,12 +379,34 @@ class BrowserManager:
         
         logger.info(f"Session saved to {filepath}")
     
-    async def load_session(self, filepath: str) -> None:
+    async def _profile_has_session(self) -> bool:
+        """Le profil persistant porte-t-il un `li_at` encore valide ?
+
+        Un cookie sans date (`expires` absent ou -1) est un cookie de session du
+        navigateur : il compte comme présent.
+        """
+        now = time.time()
+        for cookie in await self._context.cookies(_LINKEDIN_URL):
+            if cookie.get("name") != SESSION_COOKIE:
+                continue
+            expires = cookie.get("expires", -1)
+            if expires in (-1, None) or expires > now:
+                return True
+        return False
+
+    async def load_session(self, filepath: str, force: bool = False) -> None:
         """
         Load browser session from file.
-        
+
+        En mode persistant (navigateur distant par CDP), le profil du navigateur
+        est la source de vérité : le fichier n'y est injecté que si le profil n'a
+        pas de `li_at` valide, ou si ``force`` est vrai. Les cookies LinkedIn du
+        profil sont alors effacés avant l'injection, pour ne jamais mélanger deux
+        sessions (incident 2026-10-07).
+
         Args:
             filepath: Path to session file
+            force: réinjecter même si le profil a déjà une session (mode persistant)
         """
         if not Path(filepath).exists():
             raise FileNotFoundError(f"Session file not found: {filepath}")
@@ -393,10 +426,19 @@ class BrowserManager:
         if self._use_persistent_context():
             self._context = self._browser.contexts[0]
             self._owns_context = False
-            await self._context.add_cookies(storage_state_cookies(filepath))
-            logger.info(
-                "Session injectée dans le contexte persistant du navigateur distant"
-            )
+            if force or not await self._profile_has_session():
+                await self._context.clear_cookies(domain=_LINKEDIN_COOKIE_DOMAIN)
+                await self._context.add_cookies(storage_state_cookies(filepath))
+                self.session_seeded = True
+                logger.warning(
+                    "Profil sans session LinkedIn valide : session amorcée depuis %s",
+                    filepath,
+                )
+            else:
+                self.session_seeded = False
+                logger.info(
+                    "Session LinkedIn du profil conservée (%s non réinjecté)", filepath
+                )
             await self._adopt_page_in_persistent_context()
             self._is_authenticated = True
             return

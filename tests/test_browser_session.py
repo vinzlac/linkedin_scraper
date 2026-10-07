@@ -1,5 +1,6 @@
 """Tests du chargement de session et de l'empreinte du navigateur (incident 2026-09-04)."""
 import json
+import time
 
 import pytest
 
@@ -77,14 +78,26 @@ class TestNormalizeHeadlessUserAgent:
 
 
 class _FakeCtx:
-    def __init__(self, pages=None):
+    """Contexte Playwright minimal : un « bocal » de cookies au format Playwright."""
+
+    def __init__(self, pages=None, jar=None):
         self.pages = pages or []
         self.added = []
+        self.jar = list(jar or [])
+        self.cleared_with = []
         self.closed = False
         self._new_pages = 0
 
     async def add_cookies(self, cookies):
         self.added.extend(cookies)
+        self.jar.extend(cookies)
+
+    async def cookies(self, urls=None):
+        return list(self.jar)
+
+    async def clear_cookies(self, name=None, domain=None, path=None):
+        self.cleared_with.append(domain)
+        self.jar = [c for c in self.jar if not domain.search(c["domain"])]
 
     async def new_page(self):
         self._new_pages += 1
@@ -235,3 +248,104 @@ class TestPersistentContext:
 
         assert existing._new_pages == 1
         assert mgr._page.brought_to_front
+
+    @pytest.mark.asyncio
+    async def test_profile_with_valid_session_is_left_alone(self, tmp_path):
+        """Incident 2026-10-07 : à chaque relance, les cookies figés du secret
+        écrasaient ceux que LinkedIn avait rafraîchis dans le profil."""
+        live = {"name": "li_at", "value": "frais", "domain": ".www.linkedin.com",
+                "path": "/", "expires": time.time() + 86400}
+        existing = _FakeCtx(jar=[live])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert existing.added == [], "un profil déjà connecté ne doit rien recevoir"
+        assert existing.cleared_with == []
+        assert mgr.session_seeded is False
+
+    @pytest.mark.asyncio
+    async def test_seeds_and_clears_when_profile_has_no_session(self, tmp_path):
+        stale = {"name": "JSESSIONID", "value": "vieux", "domain": ".www.linkedin.com", "path": "/"}
+        existing = _FakeCtx(jar=[stale])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert mgr.session_seeded is True
+        assert len(existing.cleared_with) == 1, "les cookies LinkedIn doivent être effacés avant"
+        assert all(c["value"] != "vieux" for c in existing.jar), "aucun mélange ancien/nouveau"
+        assert {c["name"] for c in existing.jar} == {"li_at", "_px3"}
+
+    @pytest.mark.asyncio
+    async def test_seeds_when_profile_session_cookie_is_expired(self, tmp_path):
+        expired = {"name": "li_at", "value": "mort", "domain": ".www.linkedin.com",
+                   "path": "/", "expires": time.time() - 60}
+        existing = _FakeCtx(jar=[expired])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert mgr.session_seeded is True
+        assert [c["value"] for c in existing.jar if c["name"] == "li_at"] == ["x"]
+
+    @pytest.mark.asyncio
+    async def test_session_cookie_without_expiry_counts_as_present(self, tmp_path):
+        session_only = {"name": "li_at", "value": "frais", "domain": ".www.linkedin.com",
+                        "path": "/", "expires": -1}
+        existing = _FakeCtx(jar=[session_only])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        assert mgr.session_seeded is False
+        assert existing.added == []
+
+    @pytest.mark.asyncio
+    async def test_force_reseeds_even_with_a_valid_session(self, tmp_path):
+        live = {"name": "li_at", "value": "frais", "domain": ".www.linkedin.com",
+                "path": "/", "expires": time.time() + 86400}
+        existing = _FakeCtx(jar=[live])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)), force=True)
+
+        assert mgr.session_seeded is True
+        assert [c["value"] for c in existing.jar if c["name"] == "li_at"] == ["x"]
+
+    @pytest.mark.asyncio
+    async def test_clear_targets_only_linkedin_domains(self, tmp_path):
+        other = {"name": "sid", "value": "garde", "domain": ".example.com", "path": "/"}
+        existing = _FakeCtx(jar=[other])
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+
+        await mgr.load_session(str(_session_file(tmp_path)))
+
+        pattern = existing.cleared_with[0]
+        for domain in (".linkedin.com", ".www.linkedin.com", "www.linkedin.com"):
+            assert pattern.search(domain), domain
+        for domain in (".example.com", ".notlinkedin.com", "linkedin.com.evil.io"):
+            assert not pattern.search(domain), domain
+        assert other in existing.jar, "les cookies des autres sites ne doivent pas bouger"
+
+    @pytest.mark.asyncio
+    async def test_second_load_does_not_reseed(self, tmp_path):
+        existing = _FakeCtx()
+        mgr = BrowserManager(cdp_url="http://x:9222", persistent_context=True)
+        mgr._browser = _FakeBrowser([existing])
+        session = _session_file(tmp_path)
+
+        await mgr.load_session(str(session))
+        assert mgr.session_seeded is True
+        injected = len(existing.added)
+
+        await mgr.load_session(str(session))   # relance après sonde en échec
+
+        assert mgr.session_seeded is False
+        assert len(existing.added) == injected, "aucune réinjection au deuxième chargement"
