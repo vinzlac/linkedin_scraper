@@ -1,6 +1,8 @@
 """Tests for Conversation/Message models and MessagingScraper parsing."""
 
+import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -145,47 +147,6 @@ def test_conversations_from_graphql_payload_no_click():
     assert convs[0].unread_count == 2
     assert convs[0].last_message_preview == "Hello about the engine"
     assert convs[0].participant_url == "https://www.linkedin.com/in/ada/"
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_send_message_requires_text():
-    from playwright.async_api import async_playwright
-
-    from linkedin_scraper.core.exceptions import ScrapingError
-    from linkedin_scraper.scrapers.messaging import MessagingScraper
-
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        scraper = MessagingScraper(page)
-        with pytest.raises(ScrapingError, match="text is required"):
-            await scraper.send_message("2-abc", "   ")
-        await browser.close()
-
-
-@pytest.mark.unit
-@pytest.mark.asyncio
-async def test_compose_editor_locator_from_fixture():
-    from playwright.async_api import async_playwright
-
-    from linkedin_scraper.scrapers.messaging import MessagingScraper
-
-    html = """
-    <form class="msg-form">
-      <div class="msg-form__contenteditable" contenteditable="true" role="textbox"
-           aria-label="Rédigez un message…"></div>
-      <div class="msg-form__hint-text">Appuyez sur Entrée pour envoyer</div>
-    </form>
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.set_content(html)
-        scraper = MessagingScraper(page)
-        editor = scraper._compose_editor()
-        assert await editor.count() == 1
-        await browser.close()
 
 
 MESSAGES_GQL_FIXTURE = Path(__file__).parent / "fixtures" / "messenger_messages_graphql.json"
@@ -365,3 +326,173 @@ def test_self_profile_id_from_me_returns_none_when_unclear(data):
     from linkedin_scraper.scrapers.messaging import MessagingScraper
 
     assert MessagingScraper._self_profile_id_from_me(data) is None
+
+
+ME_PAYLOAD = {"miniProfile": {"dashEntityUrn": SELF_URN}}
+
+
+def _fake_scraper(
+    url="https://www.linkedin.com/messaging/",
+    status=200,
+    response=None,
+    me_status=200,
+    me_payload=None,
+):
+    """MessagingScraper over a fake page: answers /me and records the createMessage POST."""
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    page = MagicMock()
+    page.url = url
+    calls = []
+
+    async def evaluate(script, arg=None):
+        calls.append(arg)
+        if arg["body"] is None:  # GET /voyager/api/me
+            return {"status": me_status, "text": json.dumps(me_payload or ME_PAYLOAD)}
+        token = json.loads(arg["body"])["message"]["originToken"]
+        payload = response
+        if payload is None:
+            payload = {"value": {"entityUrn": "urn:li:msg_message:(a,b)", "originToken": token}}
+        return {"status": status, "text": json.dumps(payload)}
+
+    page.evaluate = evaluate
+    scraper = MessagingScraper(page)
+    scraper._open_messaging = AsyncMock()
+    scraper.ensure_logged_in = AsyncMock()
+    scraper.check_rate_limit = AsyncMock()
+    scraper._resolve_self_profile_id = AsyncMock(return_value=SELF_ID)
+    return scraper, calls
+
+
+def _posts(calls):
+    return [c for c in calls if c["body"] is not None]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "conversation_id, text, error",
+    [
+        ("2-abc", "   ", "text is required"),
+        ("  ", "hi", "conversation_id is required"),
+    ],
+)
+async def test_send_message_requires_text(conversation_id, text, error):
+    from linkedin_scraper.core.exceptions import ScrapingError
+
+    scraper, calls = _fake_scraper()
+    with pytest.raises(ScrapingError, match=error):
+        await scraper.send_message(conversation_id, text)
+    assert calls == []
+
+
+@pytest.mark.unit
+async def test_send_message_posts_create_message_with_text_verbatim():
+    scraper, calls = _fake_scraper()
+    text = "Bonjour Cindy,\n\nMerci pour votre retour.\n\nVincent"
+
+    assert await scraper.send_message(THREAD_ID, text) is True
+
+    posts = _posts(calls)
+    assert len(posts) == 1
+    assert posts[0]["url"].endswith("voyagerMessagingDashMessengerMessages?action=createMessage")
+    body = json.loads(posts[0]["body"])
+    assert body["message"]["body"]["text"] == text
+    assert body["message"]["conversationUrn"] == CONVERSATION_URN
+    assert len(body["trackingId"]) == 16
+    assert len(body["message"]["originToken"]) == 36
+
+
+@pytest.mark.unit
+async def test_send_message_from_a_parked_tab_navigates_once_and_reads_the_id_from_me():
+    """Real prod case: MCP parks the tab on about:blank, new scraper per call."""
+    scraper, calls = _fake_scraper(url="about:blank")
+
+    assert await scraper.send_message(THREAD_ID, "hi") is True
+
+    scraper._open_messaging.assert_awaited_once()
+    scraper.ensure_logged_in.assert_awaited()
+    scraper.check_rate_limit.assert_awaited()
+    scraper._resolve_self_profile_id.assert_not_awaited()
+    assert calls[0]["url"].endswith("/voyager/api/me")
+    assert len(_posts(calls)) == 1
+    assert json.loads(_posts(calls)[0]["body"])["mailboxUrn"] == SELF_URN
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("me_status, me_payload", [(403, {}), (200, {"miniProfile": {}})])
+async def test_send_message_falls_back_to_the_inbox_capture_when_me_fails(me_status, me_payload):
+    scraper, calls = _fake_scraper(me_status=me_status, me_payload=me_payload)
+
+    assert await scraper.send_message(THREAD_ID, "hi") is True
+
+    scraper._resolve_self_profile_id.assert_awaited_once()
+    assert len(_posts(calls)) == 1
+
+
+@pytest.mark.unit
+async def test_send_message_reuses_a_known_account_id():
+    scraper, calls = _fake_scraper()
+    scraper._self_profile_id = SELF_ID
+
+    await scraper.send_message(THREAD_ID, "hi")
+
+    assert len(calls) == 1 and calls[0]["body"] is not None  # no /me call
+    scraper._resolve_self_profile_id.assert_not_awaited()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", [400, 403, 429, 999, 500])
+async def test_send_message_raises_with_the_http_status_on_failure(status):
+    from linkedin_scraper.core.exceptions import ScrapingError
+
+    scraper, calls = _fake_scraper(status=status, response={"message": "nope"})
+
+    with pytest.raises(ScrapingError, match=f"HTTP {status}"):
+        await scraper.send_message(THREAD_ID, "hi")
+    assert len(_posts(calls)) == 1  # never retried: a retry could send twice
+
+
+@pytest.mark.unit
+async def test_send_message_raises_when_200_does_not_confirm_the_message():
+    from linkedin_scraper.core.exceptions import ScrapingError
+
+    scraper, _calls = _fake_scraper(response={"value": {}})
+
+    with pytest.raises(ScrapingError, match="entityUrn.*ne pas rejouer"):
+        await scraper.send_message(THREAD_ID, "hi")
+
+
+@pytest.mark.unit
+async def test_send_message_raises_without_replay_on_invalid_json_after_200():
+    from linkedin_scraper.core.exceptions import ScrapingError
+
+    scraper, calls = _fake_scraper()
+
+    async def evaluate(script, arg=None):
+        calls.append(arg)
+        if arg["body"] is None:
+            return {"status": 200, "text": json.dumps(ME_PAYLOAD)}
+        return {"status": 200, "text": "<html>"}
+
+    scraper.page.evaluate = evaluate
+    with pytest.raises(ScrapingError, match="ne pas rejouer"):
+        await scraper.send_message(THREAD_ID, "hi")
+    assert len(_posts(calls)) == 1
+
+
+@pytest.mark.unit
+async def test_send_message_reports_an_uncertain_send_when_the_page_breaks_mid_post():
+    from linkedin_scraper.core.exceptions import ScrapingError
+
+    scraper, calls = _fake_scraper()
+
+    async def evaluate(script, arg=None):
+        calls.append(arg)
+        if arg["body"] is None:
+            return {"status": 200, "text": json.dumps(ME_PAYLOAD)}
+        raise RuntimeError("Execution context was destroyed")
+
+    scraper.page.evaluate = evaluate
+    with pytest.raises(ScrapingError, match="^createMessage: envoi incertain, ne pas rejouer"):
+        await scraper.send_message(THREAD_ID, "hi")
+    assert len(_posts(calls)) == 1

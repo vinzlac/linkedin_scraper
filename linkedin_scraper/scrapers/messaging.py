@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 from urllib.parse import quote, unquote
@@ -66,7 +68,6 @@ _UNCONFIRMED = "HTTP 200 reçu — message probablement envoyé, ne pas rejouer"
 
 _THREAD_RE = re.compile(r"/messaging/thread/([^/?#]+)/?", re.IGNORECASE)
 _UNREAD_RE = re.compile(r"(\d+)\s*(nouvelle|new)", re.IGNORECASE)
-_SEND_BUTTON_RE = re.compile(r"^(send|envoyer)$", re.IGNORECASE)
 _FSD_PROFILE_RE = re.compile(r"urn:li:fsd_profile:([A-Za-z0-9_-]+)")
 
 
@@ -574,6 +575,60 @@ class MessagingScraper(BaseScraper):
             raise ScrapingError("voyager GraphQL response is not an object")
         return data
 
+    async def _voyager_rest(
+        self, url: str, *, body: Optional[dict[str, Any]] = None
+    ) -> tuple[int, str]:
+        """Call a voyager REST endpoint from the logged-in page (cookies + CSRF).
+
+        GET when ``body`` is None, else POST of the JSON string with fetch's
+        default content type, exactly like the LinkedIn web app (ADR-021).
+        Returns (status, raw text); never raises on the HTTP status.
+        """
+        result = await self.page.evaluate(
+            """async ({ url, body }) => {
+                const csrfCookie = document.cookie.split(';')
+                    .map(s => s.trim())
+                    .find(s => s.startsWith('JSESSIONID='));
+                const token = csrfCookie
+                    ? csrfCookie.split('=').slice(1).join('=').replace(/"/g, '')
+                    : '';
+                const init = {
+                    method: body === null ? 'GET' : 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'accept': 'application/json',
+                        'csrf-token': token,
+                        'x-restli-protocol-version': '2.0.0',
+                    },
+                };
+                if (body !== null) init.body = body;
+                const res = await fetch(url, init);
+                const text = await res.text();
+                return { status: res.status, text };
+            }""",
+            {"url": url, "body": None if body is None else json.dumps(body)},
+        )
+        return int(result.get("status") or 0), result.get("text") or ""
+
+    async def _ensure_self_profile_id(self) -> str:
+        """Account fsd_profile id: /voyager/api/me first, inbox capture as fallback."""
+        if self._self_profile_id:
+            return self._self_profile_id
+        status, text = await self._voyager_rest(VOYAGER_ME_URL)
+        self_id: Optional[str] = None
+        if status == 200:
+            try:
+                self_id = self._self_profile_id_from_me(json.loads(text))
+            except json.JSONDecodeError:
+                self_id = None
+        if self_id:
+            self._self_profile_id = self_id
+            return self_id
+        logger.warning(
+            "voyager /me gave no account id (HTTP %s); falling back to inbox capture", status
+        )
+        return await self._resolve_self_profile_id()
+
     async def get_messages_graphql(
         self,
         conversation_id: str,
@@ -686,18 +741,11 @@ class MessagingScraper(BaseScraper):
         return messages
 
     async def send_message(self, conversation_id: str, text: str) -> bool:
-        """Send a text message in an existing conversation.
+        """Send a text message in an existing conversation via Voyager createMessage.
 
-        Opens the thread, types into the compose box, then sends via the
-        primary control (Envoyer/Send button if present, else Enter — LinkedIn
-        shows « Appuyez sur Entrée pour envoyer »).
-
-        Args:
-            conversation_id: Thread id from ``/messaging/thread/{id}/``.
-            text: Message body (non-empty).
-
-        Returns:
-            True if an outbound bubble matching the text appears after send.
+        No DOM: one POST from the logged-in page (ADR-021). Returns True only
+        when LinkedIn returns the created message; any other outcome raises
+        ScrapingError. Never retried here — a retry could send twice.
         """
         if not conversation_id or not conversation_id.strip():
             raise ScrapingError("conversation_id is required")
@@ -706,97 +754,40 @@ class MessagingScraper(BaseScraper):
 
         conversation_id = unquote(conversation_id.strip())
         text = text.strip()
-        url = THREAD_URL_TMPL.format(conversation_id=conversation_id)
         logger.info("Sending message to conversation %s (%s chars)", conversation_id, len(text))
-        await self.callback.on_start("MessagingSend", url)
-        await self.navigate_and_wait(url)
+        await self.callback.on_start("MessagingSend", conversation_id)
+
+        if "linkedin.com" not in (self.page.url or ""):
+            await self._open_messaging()
         await self.ensure_logged_in()
         await self.check_rate_limit()
-        await self.page.wait_for_timeout(1500)
 
-        editor = self._compose_editor()
-        if await editor.count() == 0:
-            raise ScrapingError("Message compose editor not found")
-
-        await editor.click()
-        await self.page.wait_for_timeout(200)
-        # Clear any leftover draft
-        await self.page.keyboard.press("ControlOrMeta+A")
-        await self.page.keyboard.press("Backspace")
-        # insert_text keeps newlines as characters (keyboard.type would
-        # press Enter for each "\n" and send prematurely).
-        await self.page.keyboard.insert_text(text)
-        await self.page.wait_for_timeout(400)
-
-        # Nudge Ember that content changed (some builds ignore insert_text alone)
-        await editor.evaluate(
-            """(el) => {
-                el.dispatchEvent(new InputEvent('input', { bubbles: true, data: el.innerText }));
-            }"""
+        self_id = await self._ensure_self_profile_id()
+        origin_token = str(uuid.uuid4())
+        body = self._build_create_message_body(
+            self_id,
+            conversation_id,
+            text,
+            origin_token=origin_token,
+            tracking_id=os.urandom(16).decode("latin-1"),
         )
-        await self.page.wait_for_timeout(300)
-
-        await self._click_send_or_enter()
-        await self.page.wait_for_timeout(2000)
-        # Confirm delivery first: latent reCAPTCHA iframes on /messaging/
-        # used to make post-send check_rate_limit() raise even when the
-        # outbound bubble was already present (false failure).
-        ok = await self._outbound_contains(text)
-        if ok:
-            await self.callback.on_complete("MessagingSend", True)
-            return True
-        await self.check_rate_limit()
-        await self.callback.on_complete("MessagingSend", False)
-        return False
-
-    def _compose_editor(self) -> Locator:
-        return self.page.locator(
-            '.msg-form__contenteditable[contenteditable="true"], '
-            '.msg-form__contenteditable[role="textbox"]'
-        ).first
-
-    async def _click_send_or_enter(self) -> bool:
-        """Prefer an explicit Send/Envoyer button; fall back to Enter."""
-        # Visible primary send button (some UIs / locales)
-        send_btn = self.page.get_by_role("button", name=_SEND_BUTTON_RE)
-        if await send_btn.count() > 0 and await send_btn.first.is_enabled():
-            await send_btn.first.click()
-            return True
-
-        # Class-based fallbacks seen on older layouts
-        class_btn = self.page.locator(
-            "button.msg-form__send-button, "
-            "button.msg-form__send-btn, "
-            '[data-test-msg-ui-send-button]'
-        ).first
-        if await class_btn.count() > 0 and await class_btn.is_enabled():
-            await class_btn.click()
-            return True
-
-        # Current LinkedIn FR UI: "Appuyez sur Entrée pour envoyer"
-        await self.page.keyboard.press("Enter")
+        try:
+            status, raw = await self._voyager_rest(CREATE_MESSAGE_URL, body=body)
+        except Exception as exc:  # page navigated or crashed while the POST was in flight
+            raise ScrapingError(
+                "createMessage: envoi incertain, ne pas rejouer sans vérifier le fil "
+                f"(erreur pendant l'envoi : {str(exc)[:120]})"
+            ) from exc
+        if status != 200:
+            raise ScrapingError(f"createMessage HTTP {status}: {raw[:200]}")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ScrapingError(f"createMessage invalid JSON ({_UNCONFIRMED}): {exc}") from exc
+        urn = self._created_message_urn(data, origin_token)
+        logger.info("Message created %s in conversation %s", urn, conversation_id)
+        await self.callback.on_complete("MessagingSend", True)
         return True
-
-    async def _outbound_contains(self, text: str) -> bool:
-        """Return True if a recent outbound bubble contains ``text``."""
-        needle = text.strip()
-        messages = await self._extract_messages(
-            self._conversation_id_from_url(self.page.url) or "",
-            limit=10,
-        )
-        for msg in reversed(messages):
-            if msg.direction != "outbound":
-                continue
-            if msg.text and needle in msg.text:
-                return True
-        # Fallback: any recent event body (direction detection may lag)
-        bodies = self.page.locator(".msg-s-event-listitem__body")
-        n = await bodies.count()
-        for i in range(max(0, n - 5), n):
-            body = (await bodies.nth(i).inner_text() or "").strip()
-            if needle in body:
-                return True
-        return False
 
     async def _open_messaging(self) -> None:
         if "/messaging" not in (self.page.url or ""):
