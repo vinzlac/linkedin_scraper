@@ -56,6 +56,13 @@ MESSAGING_GRAPHQL_URL = (
 MESSENGER_MESSAGES_QUERY_ID = (
     "messengerMessages.5846eeb71c981f11e0134cb6626cc314"
 )
+CREATE_MESSAGE_URL = (
+    "https://www.linkedin.com/voyager/api/"
+    "voyagerMessagingDashMessengerMessages?action=createMessage"
+)
+VOYAGER_ME_URL = "https://www.linkedin.com/voyager/api/me"
+_ACCOUNT_URN_RE = re.compile(r"urn:li:(?:fsd_profile|fs_miniProfile):([A-Za-z0-9_-]+)")
+_UNCONFIRMED = "HTTP 200 reçu — message probablement envoyé, ne pas rejouer"
 
 _THREAD_RE = re.compile(r"/messaging/thread/([^/?#]+)/?", re.IGNORECASE)
 _UNREAD_RE = re.compile(r"(\d+)\s*(nouvelle|new)", re.IGNORECASE)
@@ -64,7 +71,7 @@ _FSD_PROFILE_RE = re.compile(r"urn:li:fsd_profile:([A-Za-z0-9_-]+)")
 
 
 class MessagingScraper(BaseScraper):
-    """LinkedIn messaging via DOM scraping (list / get / send)."""
+    """LinkedIn messaging: list / get via DOM and GraphQL, send via the Voyager REST API."""
 
     def __init__(self, page: Page, callback: Optional[ProgressCallback] = None):
         super().__init__(page, callback or SilentCallback())
@@ -335,6 +342,57 @@ class MessagingScraper(BaseScraper):
         else:
             variables = f"(conversationUrn:{urn_enc})"
         return f"{MESSAGING_GRAPHQL_URL}?queryId={query_id}&variables={variables}"
+
+    @staticmethod
+    def _build_create_message_body(
+        self_profile_id: str,
+        conversation_id: str,
+        text: str,
+        *,
+        origin_token: str,
+        tracking_id: str,
+    ) -> dict[str, Any]:
+        """Body of voyagerMessagingDashMessengerMessages?action=createMessage.
+
+        Shape captured from the LinkedIn web app on 2026-10-09 (ADR-021).
+        """
+        conversation_id = unquote(conversation_id.strip())
+        self_urn = f"urn:li:fsd_profile:{self_profile_id}"
+        return {
+            "message": {
+                "body": {"attributes": [], "text": text},
+                "renderContentUnions": [],
+                "conversationUrn": f"urn:li:msg_conversation:({self_urn},{conversation_id})",
+                "originToken": origin_token,
+            },
+            "mailboxUrn": self_urn,
+            "trackingId": tracking_id,
+            "dedupeByClientGeneratedToken": False,
+        }
+
+    @staticmethod
+    def _created_message_urn(data: dict[str, Any], origin_token: str) -> str:
+        """Confirm a createMessage response (HTTP 200 already received).
+
+        The message is most likely sent at this point, so every failure says
+        not to replay it.
+        """
+        value = data.get("value") if isinstance(data, dict) else None
+        if not isinstance(value, dict):
+            raise ScrapingError(f"createMessage: response has no 'value' ({_UNCONFIRMED})")
+        urn = value.get("entityUrn")
+        if not isinstance(urn, str) or not urn:
+            raise ScrapingError(f"createMessage: response has no entityUrn ({_UNCONFIRMED})")
+        echoed = value.get("originToken")
+        if echoed is not None and echoed != origin_token:
+            raise ScrapingError(f"createMessage: originToken mismatch ({_UNCONFIRMED})")
+        return urn
+
+    @staticmethod
+    def _self_profile_id_from_me(data: Any) -> Optional[str]:
+        """Account fsd_profile id from a /voyager/api/me response, if unambiguous."""
+        ids = set(_ACCOUNT_URN_RE.findall(json.dumps(data)))
+        return ids.pop() if len(ids) == 1 else None
 
     @staticmethod
     def _message_from_api_element(

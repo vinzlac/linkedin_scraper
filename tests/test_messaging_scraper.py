@@ -255,3 +255,113 @@ def test_self_profile_id_from_payloads():
         }
     }
     assert MessagingScraper._self_profile_id_from_payloads([payload]) == "ACoSelf123"
+
+
+SELF_ID = "ACoAAAEKNzwB4E69dZJoooWDrlDaPEU8Mpaezoc"
+THREAD_ID = "2-YjQxNTU2NjAtNzk3My00MjBmLTg5MzItODRjZDc5OTQyYWJjXzEwMA=="
+SELF_URN = f"urn:li:fsd_profile:{SELF_ID}"
+CONVERSATION_URN = f"urn:li:msg_conversation:({SELF_URN},{THREAD_ID})"
+
+
+@pytest.mark.unit
+def test_build_create_message_body_matches_captured_format():
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    body = MessagingScraper._build_create_message_body(
+        SELF_ID,
+        THREAD_ID,
+        "Bonjour Cindy,\n\nMerci.",
+        origin_token="0b6f3c1e-1111-4222-8333-944455556666",
+        tracking_id="\x8a\x01\xf0abcdefghijklm",
+    )
+    assert body == {
+        "message": {
+            "body": {"attributes": [], "text": "Bonjour Cindy,\n\nMerci."},
+            "renderContentUnions": [],
+            "conversationUrn": CONVERSATION_URN,
+            "originToken": "0b6f3c1e-1111-4222-8333-944455556666",
+        },
+        "mailboxUrn": SELF_URN,
+        "trackingId": "\x8a\x01\xf0abcdefghijklm",
+        "dedupeByClientGeneratedToken": False,
+    }
+
+
+@pytest.mark.unit
+def test_build_create_message_body_decodes_url_encoded_thread_id():
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    body = MessagingScraper._build_create_message_body(
+        SELF_ID, THREAD_ID.replace("==", "%3D%3D"), "hi", origin_token="t", tracking_id="x" * 16
+    )
+    assert body["message"]["conversationUrn"] == CONVERSATION_URN
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"entityUrn": "urn:li:msg_message:(x,y)", "originToken": "tok"},
+        {"entityUrn": "urn:li:msg_message:(x,y)"},
+    ],
+)
+def test_created_message_urn_accepts_the_created_message(value):
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    assert MessagingScraper._created_message_urn({"value": value}, "tok") == (
+        "urn:li:msg_message:(x,y)"
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"value": {}},
+        {"value": {"originToken": "tok"}},
+        {"value": {"entityUrn": "urn:li:msg_message:(x,y)", "originToken": "other"}},
+    ],
+)
+def test_created_message_urn_rejects_unconfirmed_responses(data):
+    from linkedin_scraper.core.exceptions import ScrapingError
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    with pytest.raises(ScrapingError, match="createMessage.*ne pas rejouer"):
+        MessagingScraper._created_message_urn(data, "tok")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"miniProfile": {"dashEntityUrn": SELF_URN}},
+        {"miniProfile": {"entityUrn": f"urn:li:fs_miniProfile:{SELF_ID}"}},
+        {
+            "miniProfile": {
+                "entityUrn": f"urn:li:fs_miniProfile:{SELF_ID}",
+                "dashEntityUrn": SELF_URN,
+            },
+            "plainId": 123,
+        },
+    ],
+)
+def test_self_profile_id_from_me_reads_the_account_urn(data):
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    assert MessagingScraper._self_profile_id_from_me(data) == SELF_ID
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"miniProfile": {}},
+        {"a": "urn:li:fsd_profile:ACoAAA1", "b": "urn:li:fsd_profile:ACoAAA2"},
+    ],
+)
+def test_self_profile_id_from_me_returns_none_when_unclear(data):
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    assert MessagingScraper._self_profile_id_from_me(data) is None

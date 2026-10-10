@@ -36,3 +36,4 @@ Chaque ADR suit le format :
 | [018](018-pypi-publication.md) | Publication PyPI sous `linkedin-playwright-scraper` | Accepted |
 | [019](019-invitation-subtype-classification-showcase-event.md) | Classification par pattern d'URL pour les sous-types d'invitation (Showcase, Event) | Accepted |
 | [020](020-feed-dom-anchors-after-2026-09-rendering.md) | Ancres DOM et identité de post après la refonte du rendu du feed (septembre 2026) | Accepted |
+| [021](021-send-message-voyager-api.md) | Envoi de message via l'API Voyager `createMessage` | Accepted |
