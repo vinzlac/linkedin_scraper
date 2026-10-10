@@ -64,7 +64,7 @@ CREATE_MESSAGE_URL = (
 )
 VOYAGER_ME_URL = "https://www.linkedin.com/voyager/api/me"
 _ACCOUNT_URN_RE = re.compile(r"urn:li:(?:fsd_profile|fs_miniProfile):([A-Za-z0-9_-]+)")
-_UNCONFIRMED = "HTTP 200 reçu — message probablement envoyé, ne pas rejouer"
+_UNCONFIRMED = "createMessage: ne pas rejouer — HTTP 200 reçu, message probablement envoyé"
 
 _THREAD_RE = re.compile(r"/messaging/thread/([^/?#]+)/?", re.IGNORECASE)
 _UNREAD_RE = re.compile(r"(\d+)\s*(nouvelle|new)", re.IGNORECASE)
@@ -380,13 +380,13 @@ class MessagingScraper(BaseScraper):
         """
         value = data.get("value") if isinstance(data, dict) else None
         if not isinstance(value, dict):
-            raise ScrapingError(f"createMessage: response has no 'value' ({_UNCONFIRMED})")
+            raise ScrapingError(f"{_UNCONFIRMED} (réponse sans 'value')")
         urn = value.get("entityUrn")
         if not isinstance(urn, str) or not urn:
-            raise ScrapingError(f"createMessage: response has no entityUrn ({_UNCONFIRMED})")
+            raise ScrapingError(f"{_UNCONFIRMED} (réponse sans entityUrn)")
         echoed = value.get("originToken")
         if echoed is not None and echoed != origin_token:
-            raise ScrapingError(f"createMessage: originToken mismatch ({_UNCONFIRMED})")
+            raise ScrapingError(f"{_UNCONFIRMED} (originToken différent)")
         return urn
 
     @staticmethod
@@ -783,7 +783,7 @@ class MessagingScraper(BaseScraper):
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise ScrapingError(f"createMessage invalid JSON ({_UNCONFIRMED}): {exc}") from exc
+            raise ScrapingError(f"{_UNCONFIRMED} (JSON invalide : {exc})") from exc
         urn = self._created_message_urn(data, origin_token)
         logger.info("Message created %s in conversation %s", urn, conversation_id)
         await self.callback.on_complete("MessagingSend", True)

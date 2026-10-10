@@ -284,6 +284,27 @@ def test_created_message_urn_accepts_the_created_message(value):
         {"value": {"entityUrn": "urn:li:msg_message:(x,y)", "originToken": "other"}},
     ],
 )
+def test_unconfirmed_errors_lead_with_the_do_not_replay_warning(data):
+    # The worker's Telegram notice cuts the error at 160 chars after an MCP
+    # prefix: the warning must come first or a human may re-approve the draft.
+    from linkedin_scraper.core.exceptions import ScrapingError
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    with pytest.raises(ScrapingError) as excinfo:
+        MessagingScraper._created_message_urn(data, "tok")
+    assert str(excinfo.value).startswith("createMessage: ne pas rejouer")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"value": {}},
+        {"value": {"originToken": "tok"}},
+        {"value": {"entityUrn": "urn:li:msg_message:(x,y)", "originToken": "other"}},
+    ],
+)
 def test_created_message_urn_rejects_unconfirmed_responses(data):
     from linkedin_scraper.core.exceptions import ScrapingError
     from linkedin_scraper.scrapers.messaging import MessagingScraper
@@ -458,7 +479,7 @@ async def test_send_message_raises_when_200_does_not_confirm_the_message():
 
     scraper, _calls = _fake_scraper(response={"value": {}})
 
-    with pytest.raises(ScrapingError, match="entityUrn.*ne pas rejouer"):
+    with pytest.raises(ScrapingError, match="ne pas rejouer.*entityUrn"):
         await scraper.send_message(THREAD_ID, "hi")
 
 
