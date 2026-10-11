@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -20,6 +21,31 @@ from ..models.message import Message, MessageDirection
 
 _PROFILE_ID_IN_URL_RE = re.compile(r"/in/([A-Za-z0-9_-]+)")
 _OWNER_ID_IN_EVENT_URN_RE = re.compile(r"urn:li:fsd_profile:([A-Za-z0-9_-]+)")
+
+
+_EVENT_ID_RE = re.compile(r",2-([A-Za-z0-9+/=_-]+)\)\s*$")
+_EPOCH_MS_PREFIX_RE = re.compile(r"^(\d{13})")
+
+
+def sent_at_from_event_urn(event_urn: Optional[str]) -> Optional[str]:
+    """Horodatage ISO 8601 (UTC) d'un message du thread DOM, lu dans son ``data-event-urn``.
+
+    Le ``<time>`` du DOM n'affiche que l'heure locale (« 11:27 », sans date) ; en
+    revanche l'id du message (``…,2-<base64>)``) commence par l'epoch en millisecondes
+    de l'envoi. ``None`` si l'id n'est pas décodable : jamais d'heure sans date.
+    """
+    match = _EVENT_ID_RE.search(event_urn or "")
+    if not match:
+        return None
+    token = match.group(1).replace("-", "+").replace("_", "/")
+    try:
+        decoded = base64.b64decode(token + "=" * (-len(token) % 4)).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    prefix = _EPOCH_MS_PREFIX_RE.match(decoded)
+    if not prefix:
+        return None
+    return datetime.fromtimestamp(int(prefix.group(1)) / 1000.0, tz=timezone.utc).isoformat()
 
 
 def resolve_message_direction(
@@ -893,28 +919,25 @@ class MessagingScraper(BaseScraper):
         # LinkedIn lists oldest→newest; take the last `limit` events
         start = max(0, count - limit)
         results: list[Message] = []
+        group: tuple[Optional[str], Optional[str]] = (None, None)
         for i in range(start, count):
             event = events.nth(i)
-            msg = await self._parse_message(event, conversation_id)
+            # LinkedIn n'affiche nom et lien qu'au 1er message d'un groupe : on lit
+            # l'en-tête de chaque événement (même sans corps, ex. pièce jointe) et les
+            # messages sans en-tête héritent de l'expéditeur du dernier en-tête vu.
+            header = await self._read_sender_header(event)
+            if header != (None, None):
+                group = header
+            msg = await self._parse_message(event, conversation_id, group)
             if msg is not None:
                 results.append(msg)
         return results
 
-    async def _parse_message(
-        self, event: Locator, conversation_id: str
-    ) -> Optional[Message]:
-        raw = (await event.inner_text() or "").strip()
-        urn = await event.get_attribute("data-event-urn")
-        classes = (await event.get_attribute("class") or "").lower()
-
-        body_el = event.locator(".msg-s-event-listitem__body").first
-        text = None
-        if await body_el.count():
-            text = (await body_el.inner_text() or "").strip() or None
-        if not text:
-            # Skip pure UI chrome events without body
-            return None
-
+    @staticmethod
+    async def _read_sender_header(
+        event: Locator,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """(nom, url profil) de l'en-tête d'un événement, ``(None, None)`` sans en-tête."""
         sender_el = event.locator(
             ".msg-s-message-group__name, .msg-s-message-group__profile-link"
         ).first
@@ -928,15 +951,34 @@ class MessagingScraper(BaseScraper):
             href = await sender_link.get_attribute("href")
             if href:
                 sender_url = href if href.startswith("http") else f"https://www.linkedin.com{href}"
+        return sender_name, sender_url
+
+    async def _parse_message(
+        self,
+        event: Locator,
+        conversation_id: str,
+        group_sender: tuple[Optional[str], Optional[str]] = (None, None),
+    ) -> Optional[Message]:
+        raw = (await event.inner_text() or "").strip()
+        urn = await event.get_attribute("data-event-urn")
+        classes = (await event.get_attribute("class") or "").lower()
+
+        body_el = event.locator(".msg-s-event-listitem__body").first
+        text = None
+        if await body_el.count():
+            text = (await body_el.inner_text() or "").strip() or None
+        if not text:
+            # Skip pure UI chrome events without body
+            return None
+
+        sender_name, sender_url = await self._read_sender_header(event)
+        if sender_name is None and sender_url is None:
+            sender_name, sender_url = group_sender
 
         time_el = event.locator("time").first
-        sent_at = None
-        if await time_el.count():
-            sent_at = (
-                await time_el.get_attribute("datetime")
-                or (await time_el.inner_text() or "").strip()
-                or None
-            )
+        sent_at = sent_at_from_event_urn(urn)
+        if sent_at is None and await time_el.count():
+            sent_at = await time_el.get_attribute("datetime") or None
 
         direction = resolve_message_direction(classes, sender_url, urn)
 
@@ -947,6 +989,6 @@ class MessagingScraper(BaseScraper):
             sender_url=sender_url,
             direction=direction,
             text=text,
-            sent_at=sent_at.strip() if isinstance(sent_at, str) else sent_at,
+            sent_at=sent_at,
             raw_event_text=raw,
         )
