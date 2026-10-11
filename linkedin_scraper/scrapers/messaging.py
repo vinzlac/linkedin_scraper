@@ -24,7 +24,11 @@ _OWNER_ID_IN_EVENT_URN_RE = re.compile(r"urn:li:fsd_profile:([A-Za-z0-9_-]+)")
 
 
 _EVENT_ID_RE = re.compile(r",2-([A-Za-z0-9+/=_-]+)\)\s*$")
-_EPOCH_MS_PREFIX_RE = re.compile(r"^(\d{13})")
+_EPOCH_MS_PREFIX_RE = re.compile(rb"^(\d{13})(?!\d)")
+# Fenêtre de plausibilité d'un envoi : LinkedIn Messaging n'existe pas avant 2003,
+# et un horodatage plus de 24 h dans le futur est un faux positif du décodage.
+_MIN_PLAUSIBLE_EPOCH_MS = 1_041_379_200_000  # 2003-01-01T00:00:00Z
+_MAX_FUTURE_SKEW_S = 24 * 3600
 
 
 def sent_at_from_event_urn(event_urn: Optional[str]) -> Optional[str]:
@@ -39,13 +43,17 @@ def sent_at_from_event_urn(event_urn: Optional[str]) -> Optional[str]:
         return None
     token = match.group(1).replace("-", "+").replace("_", "/")
     try:
-        decoded = base64.b64decode(token + "=" * (-len(token) % 4)).decode("ascii")
-    except (ValueError, UnicodeDecodeError):
+        decoded = base64.b64decode(token + "=" * (-len(token) % 4))
+    except ValueError:
         return None
     prefix = _EPOCH_MS_PREFIX_RE.match(decoded)
     if not prefix:
         return None
-    return datetime.fromtimestamp(int(prefix.group(1)) / 1000.0, tz=timezone.utc).isoformat()
+    epoch_ms = int(prefix.group(1))
+    latest_ms = (datetime.now(timezone.utc).timestamp() + _MAX_FUTURE_SKEW_S) * 1000
+    if not _MIN_PLAUSIBLE_EPOCH_MS <= epoch_ms <= latest_ms:
+        return None
+    return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).isoformat()
 
 
 def resolve_message_direction(

@@ -130,3 +130,16 @@ async def test_header_without_profile_link_does_not_inherit_the_previous_url():
 
     assert messages[1].sender_name == "Acme Corp"
     assert messages[1].sender_url is None
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_time_datetime_attribute_is_the_fallback_when_the_urn_has_no_epoch():
+    html = (
+        '<ul><li class="msg-s-event-listitem" data-event-urn="urn:li:msg_message:garbage">'
+        '<div class="msg-s-event-listitem__body">x'
+        '<time datetime="2026-10-11T08:00:00+00:00">08:00</time></div></li></ul>'
+    )
+    messages = await _extract(html)
+
+    assert messages[0].sent_at == "2026-10-11T08:00:00+00:00"
