@@ -927,7 +927,7 @@ class MessagingScraper(BaseScraper):
         # LinkedIn lists oldest→newest; take the last `limit` events
         start = max(0, count - limit)
         results: list[Message] = []
-        group: tuple[Optional[str], Optional[str]] = (None, None)
+        group = await self._group_header_before(events, start)
         for i in range(start, count):
             event = events.nth(i)
             # LinkedIn n'affiche nom et lien qu'au 1er message d'un groupe : on lit
@@ -942,6 +942,26 @@ class MessagingScraper(BaseScraper):
         return results
 
     @staticmethod
+    async def _group_header_before(
+        events: Locator, start: int
+    ) -> tuple[Optional[str], Optional[str]]:
+        """En-tête du groupe en cours au début de la fenêtre.
+
+        Si le premier événement de la fenêtre n'a pas d'en-tête, il continue un
+        groupe commencé plus haut : on remonte les événements déjà chargés jusqu'au
+        dernier en-tête. ``(None, None)`` si le groupe est hors du DOM chargé.
+        """
+        if start == 0:
+            return (None, None)
+        if await MessagingScraper._read_sender_header(events.nth(start)) != (None, None):
+            return (None, None)
+        for i in range(start - 1, -1, -1):
+            header = await MessagingScraper._read_sender_header(events.nth(i))
+            if header != (None, None):
+                return header
+        return (None, None)
+
+    @staticmethod
     async def _read_sender_header(
         event: Locator,
     ) -> tuple[Optional[str], Optional[str]]:
@@ -953,7 +973,10 @@ class MessagingScraper(BaseScraper):
         if await sender_el.count():
             sender_name = (await sender_el.inner_text() or "").strip() or None
 
-        sender_link = event.locator('a[href*="/in/"]').first
+        # Un lien /in/ collé dans le corps d'un message n'est pas l'expéditeur.
+        sender_link = event.locator(
+            'a[href*="/in/"]:not(.msg-s-event-listitem__body a)'
+        ).first
         sender_url = None
         if await sender_link.count():
             href = await sender_link.get_attribute("href")

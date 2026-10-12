@@ -143,3 +143,54 @@ async def test_time_datetime_attribute_is_the_fallback_when_the_urn_has_no_epoch
     messages = await _extract(html)
 
     assert messages[0].sent_at == "2026-10-11T08:00:00+00:00"
+
+
+async def _extract_limited(html, limit):
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content(html)
+        messages = await MessagingScraper(page)._extract_messages("conv", limit=limit)
+        await browser.close()
+    return messages
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_window_start_inherits_the_header_of_a_group_started_before_it():
+    # Le groupe de Fabien commence avant la fenêtre `limit` : son 2e message,
+    # premier de la fenêtre, n'a pas d'en-tête mais doit rester attribué à Fabien.
+    html = "<ul>" + "".join(
+        [
+            _event(OTHER, "bonjour", link="Fabien"),
+            _event(OTHER, "suite du groupe"),
+            _event(SELF, "ma reponse", link="Vincent"),
+        ]
+    ) + "</ul>"
+    messages = await _extract_limited(html, limit=2)
+
+    assert [m.text for m in messages] == ["suite du groupe", "ma reponse"]
+    assert messages[0].sender_name == "Fabien"
+    assert messages[0].direction == "inbound"
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_profile_link_inside_the_message_body_is_not_the_sender():
+    # Le destinataire colle un lien /in/ de VINCENT dans le corps de son message
+    # de continuation : ce lien ne doit ni devenir l'expéditeur ni inverser la direction.
+    body_link = (
+        f'<li class="msg-s-event-listitem" data-event-urn="urn:li:msg_message:(urn:li:fsd_profile:{SELF},2-lnk)">'
+        '<div class="msg-s-event-listitem__body">voici '
+        f'<a href="https://www.linkedin.com/in/{SELF}">son profil</a></div></li>'
+    )
+    html = "<ul>" + _event(OTHER, "bonjour", link="Fabien") + body_link + "</ul>"
+    messages = await _extract_limited(html, limit=10)
+
+    assert messages[1].sender_name == "Fabien"
+    assert messages[1].sender_url.endswith(OTHER)
+    assert messages[1].direction == "inbound"
