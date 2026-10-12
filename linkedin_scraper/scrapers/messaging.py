@@ -973,10 +973,7 @@ class MessagingScraper(BaseScraper):
         if await sender_el.count():
             sender_name = (await sender_el.inner_text() or "").strip() or None
 
-        # Un lien /in/ collé dans le corps d'un message n'est pas l'expéditeur.
-        sender_link = event.locator(
-            'a[href*="/in/"]:not(.msg-s-event-listitem__body a)'
-        ).first
+        sender_link = event.locator('a[href*="/in/"]').first
         sender_url = None
         if await sender_link.count():
             href = await sender_link.get_attribute("href")
