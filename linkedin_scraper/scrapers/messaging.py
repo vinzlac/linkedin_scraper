@@ -768,11 +768,37 @@ class MessagingScraper(BaseScraper):
         await self.navigate_and_wait(url)
         await self.ensure_logged_in()
         await self.check_rate_limit()
-        await self.page.wait_for_timeout(1500)
+        await self._wait_for_thread_events()
 
         messages = await self._extract_messages(conversation_id, limit=limit)
         await self.callback.on_complete("MessagingThread", messages)
         return messages
+
+    async def _wait_for_thread_events(
+        self,
+        poll_ms: int = 400,
+        stable_polls: int = 3,
+        max_wait_ms: int = 10000,
+    ) -> None:
+        """Wait until the thread stops rendering new events.
+
+        LinkedIn renders the thread progressively; a fixed pause could read only
+        the first message (Cindy D., 2026-10-12). Returns once the event count is
+        non-zero and unchanged for ``stable_polls`` polls, or after ``max_wait_ms``.
+        """
+        events = self.page.locator(".msg-s-event-listitem")
+        previous = -1
+        stable = 0
+        waited = 0
+        while waited < max_wait_ms:
+            await self.page.wait_for_timeout(poll_ms)
+            waited += poll_ms
+            count = await events.count()
+            stable = stable + 1 if count == previous and count > 0 else 0
+            previous = count
+            if stable >= stable_polls:
+                return
+        logger.warning("Thread events still changing after %sms (count=%s)", max_wait_ms, previous)
 
     async def send_message(self, conversation_id: str, text: str) -> bool:
         """Send a text message in an existing conversation via Voyager createMessage.

@@ -198,3 +198,41 @@ async def test_profile_link_inside_the_message_body_is_not_the_sender():
     assert messages[1].sender_name == "Fabien"
     assert messages[1].sender_url.endswith(OTHER)
     assert messages[1].direction == "inbound"
+
+
+PROGRESSIVE_JS = """
+(() => {
+  const ul = document.querySelector('ul');
+  const items = %s;
+  items.forEach((html, i) => setTimeout(() => ul.insertAdjacentHTML('beforeend', html), 300 * i));
+})()
+"""
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_wait_for_thread_waits_until_events_stop_arriving():
+    """Un fil rendu progressivement ne doit pas être lu à moitié (Cindy D., 2026-10-12)."""
+    import json
+
+    from playwright.async_api import async_playwright
+
+    from linkedin_scraper.scrapers.messaging import MessagingScraper
+
+    events = [
+        _event(OTHER, "bonjour", link="Cindy"),
+        _event(OTHER, "deuxieme"),
+        _event(SELF, "reponse", link="Vincent"),
+        _event(OTHER, "merci", link="Cindy"),
+    ]
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+        await page.set_content("<ul></ul>")
+        await page.evaluate(PROGRESSIVE_JS % json.dumps(events))
+        scraper = MessagingScraper(page)
+        await scraper._wait_for_thread_events()
+        messages = await scraper._extract_messages("conv", limit=10)
+        await browser.close()
+
+    assert [m.text for m in messages] == ["bonjour", "deuxieme", "reponse", "merci"]
