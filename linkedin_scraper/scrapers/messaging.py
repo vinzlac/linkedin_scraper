@@ -999,12 +999,21 @@ class MessagingScraper(BaseScraper):
         if await sender_el.count():
             sender_name = (await sender_el.inner_text() or "").strip() or None
 
-        sender_link = event.locator('a[href*="/in/"]').first
+        # First /in/ link outside the message body: a profile pasted in the text
+        # is not the sender. Filtered in JS, not with a ``:not(... a)`` selector,
+        # which truncated get_conversation live (4.7.4).
+        href = await event.evaluate(
+            """el => {
+                const body = el.querySelector('.msg-s-event-listitem__body');
+                for (const a of el.querySelectorAll('a[href*="/in/"]')) {
+                    if (!body || !body.contains(a)) return a.getAttribute('href');
+                }
+                return null;
+            }"""
+        )
         sender_url = None
-        if await sender_link.count():
-            href = await sender_link.get_attribute("href")
-            if href:
-                sender_url = href if href.startswith("http") else f"https://www.linkedin.com{href}"
+        if href:
+            sender_url = href if href.startswith("http") else f"https://www.linkedin.com{href}"
         return sender_name, sender_url
 
     async def _parse_message(

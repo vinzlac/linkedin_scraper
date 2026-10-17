@@ -178,10 +178,6 @@ async def test_window_start_inherits_the_header_of_a_group_started_before_it():
     assert messages[0].direction == "inbound"
 
 
-@pytest.mark.skip(
-    reason="Exclusion des liens du corps retirée en 4.7.5 : le sélecteur :not(... a) "
-    "tronquait get_conversation en live (4.7.4). À refaire autrement."
-)
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_profile_link_inside_the_message_body_is_not_the_sender():
