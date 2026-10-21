@@ -475,6 +475,112 @@ class TestExtractAuthorFromPostCardDom:
         assert result["source"] == "degree_suffix_anchor"
 
 
+class TestOwnPostWithoutRepostButtonDom:
+    """Un post de l'utilisateur connecté n'a pas de bouton « Republier ».
+
+    Constaté en live le 2026-10-21 (B-003 de linkedin-mcp) : sur la page de
+    détail d'un post publié par le compte connecté, la barre d'action n'a
+    qu'une réaction et « Commenter » (zéro « Republier »), alors que les cartes
+    du fil des tiers en ont une chacune. L'extraction ancrait chaque carte sur
+    ce bouton : `scrape_post` répondait « No post extracted from detail URL ».
+
+    La fixture est reconstruite à partir des libellés de boutons et du texte
+    relevés en live (le post de test a été supprimé avant de pouvoir figer son
+    HTML) : la structure exacte des conteneurs est approximée.
+    """
+
+    # Page de détail relevée en live le 2026-10-21 : barre de navigation, carte du
+    # post (activité dans un `data-testid`, permalien en /posts/share-…), puis pied
+    # de page. Les boutons d'action sont des icônes : leur texte est un espace
+    # invisible (U+200B), le libellé « Commenter » n'est que dans l'aria-label.
+    OWN_POST_CARD_HTML = """
+    <nav><a href="/feed/">Accueil</a> <a href="/mynetwork/">R&eacute;seau</a></nav>
+    <div><div data-testid="urn:li:activity:7518740107428872192">
+      <div>Post du fil d&rsquo;actualit&eacute;</div>
+      <div>Ce type de post ne peut pas &ecirc;tre boost&eacute;.</div>
+      <a href="/in/vincent-lacoste-590a145/"><span aria-hidden="true"></span>Vincent Lacoste</a>
+      <span>&bull; Vous</span>
+      <div>Architecte Applicatif, Technique &amp; Solution - Staff Engineer - Tech Lead</div>
+      <a href="/posts/share-7518740106745147393-XS1v/">1 min</a>
+      <button aria-label="Ouvrir le menu de commandes pour le post de Vincent Lacoste"></button>
+      <div>Test technique</div>
+      <div><button aria-label="&Eacute;tat du bouton de r&eacute;action : aucune r&eacute;action">&#8203;</button></div>
+      <div><button aria-label="Ouvrir le menu des r&eacute;actions"></button></div>
+      <div><button aria-label="Commenter">&#8203;</button></div>
+    </div></div>
+    <footer><a href="#">&Agrave; propos</a> <a href="#">Accessibilit&eacute;</a>
+      <span>LinkedIn Corporation &copy; 2026</span></footer>
+    """
+
+    # Carte de tiers : même forme que FEED_CARD_HTML (une « Republier » par carte).
+    THIRD_PARTY_CARD_HTML = """
+    <div data-urn="urn:li:activity:7500930546110382080">
+      <a href="/in/alexxubyte/"><span aria-hidden="true"></span>Alex Xu</a>
+      <span>&bull; 1er</span>
+      <a href="/feed/update/urn:li:activity:7500930546110382080/">2 h</a>
+      <div>9 Distributed Systems Patterns You Should Know, un contenu de test
+      suffisamment long pour passer les filtres du scraper.</div>
+      <button aria-label="1457 r&eacute;actions">1457</button>
+      <button>J'aime</button>
+      <button>Commenter</button>
+      <button>Republier</button>
+    </div>
+    """
+
+    @staticmethod
+    async def _extract(html: str, url: str):
+        """Sert `html` à `url` : la page de détail lit son URL pour l'identité du post."""
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch()
+            try:
+                page = await browser.new_page()
+                await page.route(
+                    url,
+                    lambda route: route.fulfill(
+                        body=f"<html><body>{html}</body></html>",
+                        content_type="text/html",
+                    ),
+                )
+                await page.goto(url)
+                return await FeedScraper(page)._extract_posts_from_feed()
+            finally:
+                await browser.close()
+
+    @pytest.mark.asyncio
+    async def test_extracts_own_post_detail_page_that_has_no_repost_button(self):
+        posts = await self._extract(
+            self.OWN_POST_CARD_HTML,
+            "https://www.linkedin.com/posts/share-7518740106745147393-XS1v/",
+        )
+
+        assert len(posts) == 1
+        assert posts[0].text == "Test technique"
+        assert posts[0].urn == "urn:li:activity:7518740107428872192"
+        # URL construite sur le vrai URN d'activité (et non sur l'id du slug share-).
+        assert posts[0].linkedin_url == (
+            "https://www.linkedin.com/feed/update/urn:li:activity:7518740107428872192/"
+        )
+
+    @pytest.mark.asyncio
+    async def test_extracts_own_post_and_third_party_post_from_the_same_feed(self):
+        # Un fil réel a plusieurs cartes : deux « Republier » délimitent chacune la leur.
+        other_third_party = self.THIRD_PARTY_CARD_HTML.replace(
+            "7500930546110382080", "7500930546110382081"
+        )
+        posts = await self._extract(
+            self.THIRD_PARTY_CARD_HTML + other_third_party + self.OWN_POST_CARD_HTML,
+            "https://www.linkedin.com/feed/",
+        )
+
+        assert {p.urn for p in posts} == {
+            "urn:li:activity:7500930546110382080",
+            "urn:li:activity:7500930546110382081",
+            "urn:li:activity:7518740107428872192",
+        }
+
+
 class TestFeedCardCountsAndCommentsDom:
     """Exercises the real feed-card JS against a headless page.
 

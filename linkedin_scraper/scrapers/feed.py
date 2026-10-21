@@ -789,17 +789,35 @@ class FeedScraper(BaseScraper):
                 };
             }
 
-            for (var bi = 0; bi < repostBtns.length; bi++) {
-                var btn = repostBtns[bi];
-
-                var el = btn.parentElement;
-                while (el && el !== document.body) {
-                    var parent = el.parentElement;
-                    if (!parent || parent === document.body) break;
-                    var parentCount = Array.from(parent.querySelectorAll("button")).filter(isRepostButton).length;
-                    if (parentCount > 1) break;
-                    el = el.parentElement;
+            // LinkedIn n'affiche pas « Republier » sur les posts du compte connecté : une
+            // carte sans ce bouton est ancrée sur son bouton « Commenter » (B-003).
+            function isCommentButton(b) {
+                if (!b) return false;
+                var t = (b.innerText || "").trim();
+                if (t === "Commenter" || t === "Comment") return true;
+                var aria = (b.getAttribute("aria-label") || "").trim();
+                return aria === "Commenter" || aria === "Comment";
+            }
+            function cardOf(btn, isAnchor) {
+                var node = btn.parentElement;
+                while (node && node !== document.body) {
+                    var up = node.parentElement;
+                    if (!up || up === document.body) break;
+                    var anchorCount = Array.from(up.querySelectorAll("button")).filter(isAnchor).length;
+                    if (anchorCount > 1) break;
+                    node = node.parentElement;
                 }
+                return node;
+            }
+            var repostCards = repostBtns.map(function(b) { return cardOf(b, isRepostButton); });
+            var anchors = repostBtns.map(function(b) { return { btn: b, isAnchor: isRepostButton }; });
+            Array.from(document.querySelectorAll("button")).filter(isCommentButton).forEach(function(b) {
+                var inRepostCard = repostCards.some(function(c) { return c && c !== document.body && c.contains(b); });
+                if (!inRepostCard) anchors.push({ btn: b, isAnchor: isCommentButton });
+            });
+
+            for (var bi = 0; bi < anchors.length; bi++) {
+                var el = cardOf(anchors[bi].btn, anchors[bi].isAnchor);
 
                 if (!el || el === document.body) continue;
                 if (seenContainers.indexOf(el) >= 0) continue;
@@ -994,11 +1012,14 @@ class FeedScraper(BaseScraper):
                     "… plus": 1, "Afficher la traduction": 1, "Show translation": 1,
                 };
 
+                // Sur un post du compte connecté, les boutons d'action sont des icônes sans
+                // libellé visible : leur texte n'est qu'un espace invisible (B-003).
+                function isInvisibleLine(l) { return /^[\\u200b-\\u200d\\u2060\\ufeff]+$/.test(l); }
                 var startIdx = -1;
                 var endIdx = allLines.length;
                 for (var i = 0; i < allLines.length; i++) {
                     if (startIdx < 0 && isTimeLine(allLines[i])) startIdx = i + 1;
-                    if (actionWords[allLines[i]]) { endIdx = i; break; }
+                    if (actionWords[allLines[i]] || isInvisibleLine(allLines[i])) { endIdx = i; break; }
                 }
 
                 // Barre d'action (J'aime / Commenter / Republier / Envoyer) : frontière
@@ -1012,7 +1033,7 @@ class FeedScraper(BaseScraper):
                 };
                 var actionBarIdx = allLines.length;
                 for (var i = 0; i < allLines.length; i++) {
-                    if (actionBarWords[allLines[i]]) { actionBarIdx = i; break; }
+                    if (actionBarWords[allLines[i]] || isInvisibleLine(allLines[i])) { actionBarIdx = i; break; }
                 }
 
                 // Skip profile-level follow/connect buttons that appear right after the date
