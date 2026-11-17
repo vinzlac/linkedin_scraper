@@ -61,6 +61,8 @@ Les deux formes (suffixe et préfixe) sont reconnues, les formes plurielles incl
 
 Là où ADR-004 pariait sur la stabilité d'un attribut propriétaire, la règle devient : **s'ancrer en priorité sur ce que l'utilisateur voit** (libellés FR/EN, forme des lignes, position relative à la barre d'action) et sur la **structure invariante** (un bouton Republier par carte, l'horodatage précède le contenu), en traitant tout attribut LinkedIn comme un raccourci opportuniste et non comme un contrat.
 
+> **Note (2026-11-17).** « Un bouton Republier par carte » n'est **pas** invariant : LinkedIn n'affiche pas « Republier » sur les posts du compte connecté. Depuis la v4.7.8 (`ab188ac`, #15, 2026-10-21), une carte sans « Republier » est ancrée sur son bouton « Commenter », et une ligne faite des seuls espaces invisibles (U+200B) des boutons icône marque le début de la barre d'action. Cas non couvert, noté dans ce commit : un fil ne contenant qu'un seul « Republier » englobe toute la page, et un post du compte connecté y est alors vu comme déjà couvert.
+
 Corollaire opérationnel : toute correction de sélecteur doit être **validée sur le feed live** avant d'être considérée comme faite, et figée par une fixture DOM calquée sur le rendu réel (cf. `TestFeedCardActorAndCountsDom`, `TestFeedCardCountsAndCommentsDom`, `TestExpandVisibleCommentsDom`).
 
 ## Consequences
