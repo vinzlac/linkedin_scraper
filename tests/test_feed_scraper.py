@@ -580,6 +580,39 @@ class TestOwnPostWithoutRepostButtonDom:
             "urn:li:activity:7518740107428872192",
         }
 
+    OWN_POST_URL = (
+        "https://www.linkedin.com/posts/share-7518740106745147393-XS1v/"
+    )
+
+    async def _extract_own_post_with(self, extra_html: str):
+        """Le post du compte connecté, `extra_html` inséré dans sa carte."""
+        anchor = "<div>Test technique</div>"
+        html = self.OWN_POST_CARD_HTML.replace(anchor, anchor + extra_html)
+        return await self._extract(html, self.OWN_POST_URL)
+
+    @pytest.mark.asyncio
+    async def test_page_level_blank_iframe_is_not_taken_for_a_video(self):
+        # Constaté en live le 2026-10-21 : sur la page de détail, la carte
+        # couvre toute la page et ramassait un iframe technique de LinkedIn
+        # (src « about:blank ») comme vidéo, alors que le post n'en a pas.
+        posts = await self._extract_own_post_with(
+            '<iframe src="about:blank" style="display:none"></iframe>'
+        )
+
+        assert len(posts) == 1
+        assert posts[0].video_url is None
+
+    @pytest.mark.asyncio
+    async def test_external_video_embed_is_still_extracted(self):
+        # Garde-fou : le filtre ne doit pas retirer un vrai lecteur intégré.
+        embed = "https://www.youtube.com/embed/dQw4w9WgXcQ"
+        posts = await self._extract_own_post_with(
+            f'<iframe src="{embed}"></iframe>'
+        )
+
+        assert len(posts) == 1
+        assert posts[0].video_url == embed
+
 
 class TestFeedCardCountsAndCommentsDom:
     """Exercises the real feed-card JS against a headless page.

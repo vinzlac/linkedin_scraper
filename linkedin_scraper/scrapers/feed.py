@@ -1208,8 +1208,11 @@ class FeedScraper(BaseScraper):
                     var iframeEl = el.querySelector("iframe[src]");
                     if (iframeEl) videoUrl = iframeEl.getAttribute("src") || "";
                 }
-                // Reject blob: URLs — they are browser-internal and not portable
-                if (videoUrl.startsWith("blob:")) videoUrl = "";
+                // Keep only http(s) URLs. blob:, data:, javascript:
+                // and about:blank (technical LinkedIn iframe, caught
+                // when the card spans the whole detail page) are
+                // browser-internal, not a video.
+                if (!/^https?:/i.test(videoUrl)) videoUrl = "";
 
                 // ---- External link (lnkd.in shortlinks and other non-LinkedIn URLs) ----
                 // Collect first external link for article_url; lnkd.in ones are resolved in Python.
